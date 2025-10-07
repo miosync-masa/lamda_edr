@@ -180,7 +180,7 @@ def build_safe_manifold(
                 epsm = beta * epsM
                 
                 # 三軸度計算
-                from edr_fit_fixed import triax_from_path_jax
+                from edr_fit import triax_from_path_jax
                 triax_val = triax_from_path_jax(beta)
                 
                 schedule_dict = {
