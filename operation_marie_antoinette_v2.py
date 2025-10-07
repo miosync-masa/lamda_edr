@@ -577,8 +577,8 @@ def loss_binary_manifold(
         score = compute_safety_score(Lambda, safe_grams, weights)
         
         # 閾値設定（調整可能）
-        safe_threshold = 0.3
-        danger_threshold = 0.5
+        safe_threshold = 0.25   # 0.3 → 0.25
+        danger_threshold = 0.35  # 0.5 → 0.35
         
         if exp.failed == 1:
             # 破断サンプル: スコアが高いべき（danger_threshold以上）
