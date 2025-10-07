@@ -907,13 +907,26 @@ def hybrid_staged_optimization(
         
         # ステップ数を大幅増加
         for step in range(1500):
-            grads = grad_fn_flc(params_flc, flc_pts_data, mat_dict)
+            # FLC損失とバイナリ損失の混合
+            if step < 1000:
+                # 最初はFLC損失のみ
+                grads = grad_fn_flc(params_flc, flc_pts_data, mat_dict)
+            else:
+                # 後半はバイナリ損失も少し混ぜる（10:1の比率）
+                grads_flc = grad_fn_flc(params_flc, flc_pts_data, mat_dict)
+                grads_bin = grad_fn(params_flc, exps, mat)
+                grads = jax.tree_map(lambda g1, g2: 0.9 * g1 + 0.1 * g2, grads_flc, grads_bin)
+            
             updates, opt_state_flc = optimizer_flc.update(grads, opt_state_flc, params_flc)
             params_flc = optax.apply_updates(params_flc, updates)
             
             if step % 300 == 0 and verbose:
                 loss = loss_flc_true_jax(params_flc, flc_pts_data, mat_dict)
-                print(f"  Step {step:4d}: FLC Loss = {loss:.6f}")
+                if step >= 1000:
+                    bin_loss = loss_fn_jax(params_flc, exps, mat)
+                    print(f"  Step {step:4d}: FLC Loss = {loss:.6f}, Binary Loss = {bin_loss:.6f}")
+                else:
+                    print(f"  Step {step:4d}: FLC Loss = {loss:.6f}")
         
         # Phase 1.5結果を使用
         best_params = params_flc
@@ -1063,13 +1076,38 @@ def hybrid_staged_optimization(
         print(" 最適化完了！")
         print("="*60)
         
-        # Final Validation
+        # Final Validation（正しいパラメータを使用）
         print("\n=== Final Validation ===")
         mat_dict = mat_to_jax_dict(mat)
         correct = 0
+        
+        # Phase 1.5実行時はそのパラメータを使用
+        if 'params_flc' in locals():
+            final_params = params_flc
+        else:
+            # Phase 2の結果から変換
+            final_params = {
+                'log_V0': jnp.log(edr_phase2.V0),
+                'log_av': jnp.log(edr_phase2.av),
+                'log_ad': jnp.log(edr_phase2.ad),
+                'logit_chi': jnp.log(edr_phase2.chi / (1 - edr_phase2.chi)),
+                'logit_K_scale': jnp.log(edr_phase2.K_scale / (1 - edr_phase2.K_scale)),
+                'logit_K_scale_draw': jnp.log(edr_phase2.K_scale_draw / (1 - edr_phase2.K_scale_draw)),
+                'logit_K_scale_plane': jnp.log((edr_phase2.K_scale_plane - 0.1) / (0.4 - edr_phase2.K_scale_plane)),
+                'logit_K_scale_biax': jnp.log(edr_phase2.K_scale_biax / (1 - edr_phase2.K_scale_biax)),
+                'logit_triax_sens': jnp.log((edr_phase2.triax_sens - 0.1) / (0.5 - edr_phase2.triax_sens)),
+                'Lambda_crit': jnp.array(edr_phase2.Lambda_crit),
+                'logit_beta_A': jnp.log((edr_phase2.beta_A - 0.2) / (0.5 - edr_phase2.beta_A)),
+                'logit_beta_bw': jnp.log((edr_phase2.beta_bw - 0.2) / (0.35 - edr_phase2.beta_bw)),
+                'logit_beta_A_pos': jnp.log((edr_phase2.beta_A_pos - 0.3) / (0.7 - edr_phase2.beta_A_pos)),
+            }
+        
+        # パラメータを実空間に変換
+        edr_dict_for_validation = transform_params_jax(final_params)
+        
         for i, exp in enumerate(exps):
             schedule_dict = schedule_to_jax_dict(exp.schedule)
-            res = simulate_lambda_jax(schedule_dict, mat_dict, edr_dict_final)
+            res = simulate_lambda_jax(schedule_dict, mat_dict, edr_dict_for_validation)
             Lambda_smooth = smooth_signal_jax(res["Lambda"], window_size=11)
             peak = float(jnp.max(Lambda_smooth))
             D_end = float(res["Damage"][-1])
@@ -1091,7 +1129,9 @@ def hybrid_staged_optimization(
         
         accuracy = correct / len(exps) * 100
         print(f"Accuracy: {accuracy:.2f}%")
-        final_binary_loss = loss_fn_jax(params_jax_final, exps, mat)
+        
+        # バイナリ損失計算（final_paramsを使用）
+        final_binary_loss = loss_fn_jax(final_params, exps, mat)
         print(f"Final binary loss: {final_binary_loss:.4f}")
     
     return edr_final, info
