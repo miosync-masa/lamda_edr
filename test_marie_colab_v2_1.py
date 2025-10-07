@@ -311,29 +311,82 @@ print(f"  メモリ使用: 推定 {safe_count * 8 * 800 * 800 / 1e9:.2f} GB")
 # =============================================================================
 # Step 9: 結果保存
 # =============================================================================
-
 print("\n[Step 9] 結果保存")
-
 import numpy as np
 import pandas as pd
+
+# ★★★ EDRパラメータ出力を追加！！ ★★★
+print("\n" + "="*80)
+print(" 🎂 最適化されたEDRパラメータ")
+print("="*80)
+
+# Phase 1.5B後のパラメータを取得
+final_params = results.get('phase15b_params', results.get('phase0_params'))
+if final_params is not None:
+    edr_final = transform_params_jax(final_params)
+    
+    print(f"\nEDR Parameters (Optimized):")
+    print(f"  V0: {edr_final['V0']:.2e} Pa")
+    print(f"  av: {edr_final['av']:.2e}")
+    print(f"  ad: {edr_final['ad']:.2e}")
+    print(f"  chi: {edr_final['chi']:.3f}")
+    print(f"  K_scale: {edr_final['K_scale']:.3f}")
+    print(f"  triax_sens: {edr_final['triax_sens']:.3f}")
+    print(f"  Lambda_crit: {edr_final['Lambda_crit']:.3f}")
+    print(f"  K_scale_draw: {edr_final['K_scale_draw']:.3f}")
+    print(f"  K_scale_plane: {edr_final['K_scale_plane']:.3f}")
+    print(f"  K_scale_biax: {edr_final['K_scale_biax']:.3f}")
+    print(f"  beta_A: {edr_final['beta_A']:.3f}")
+    print(f"  beta_bw: {edr_final['beta_bw']:.3f}")
+    print(f"  beta_A_pos: {edr_final['beta_A_pos']:.3f} (非対称)")
+    
+    # FLC予測精度
+    print("\n[FLC予測精度]")
+    preds = []
+    for p in flc_data:
+        Em, em = predict_FLC_point(
+            p.path_ratio, p.rate_major, p.duration_max, 
+            mat_dict, edr_final
+        )
+        preds.append((Em, em))
+        error_major = abs(Em - p.major_limit) / p.major_limit * 100
+        error_minor = abs(em - p.minor_limit) / abs(p.minor_limit) * 100 if p.minor_limit != 0 else 0
+        
+        print(f"  β={p.path_ratio:+.1f}: 実測({p.major_limit:.3f}, {p.minor_limit:.3f}) "
+              f"→ 予測({Em:.3f}, {em:.3f}) "
+              f"[誤差: {error_major:.1f}%, {error_minor:.1f}%]")
+    
+    # FLC総合誤差
+    flc_error = evaluate_flc_fit(flc_data, preds)
+    print(f"\n  📊 FLC総合誤差: {flc_error:.6f}")
+    print(f"  📊 FLC制約達成: {'✅' if flc_error < 0.019699 else '❌'}")
 
 # 多様体保存
 np.savez(
     '/content/safe_manifold_v2_1.npz',
     lambdas=np.array(results['safe_manifold']['lambdas']),
     grams=np.array(results['safe_manifold']['grams']),
-    n_safe=safe_count
+    n_safe=safe_count,
+    # EDRパラメータも保存！
+    edr_params=final_params if final_params is not None else None
 )
-print("✓ 多様体: /content/safe_manifold_v2_1.npz")
+print("\n✓ 多様体: /content/safe_manifold_v2_1.npz")
 
-# パフォーマンスログ
+# パフォーマンスログ（EDRパラメータも追加）
 with open('/content/performance_log_v2_1.txt', 'w') as f:
     f.write("="*80 + "\n")
     f.write("Operation Marie Antoinette v2.1 - Performance Log\n")
     f.write("="*80 + "\n\n")
     f.write(f"Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
     
-    f.write(f"Phase 0:\n")
+    # EDRパラメータをログにも記録
+    if final_params is not None:
+        f.write("Optimized EDR Parameters:\n")
+        for key, value in edr_final.items():
+            f.write(f"  {key}: {value}\n")
+        f.write(f"\nFLC Error: {flc_error:.6f}\n")
+    
+    f.write(f"\nPhase 0:\n")
     if results['phase0_history'] is not None:
         f.write(f"  Physics Loss: {results['phase0_history'][-1]:.6f}\n")
     else:
