@@ -1030,55 +1030,24 @@ def hybrid_staged_optimization(
             print(f"  Iterations: {res.nit}")
     
     # ===========================
-    # Phase 3: AdamW微調整
+    # Phase 3: スキップ（FLC形状学習後は不要）
     # ===========================
     if verbose:
         print("\n" + "="*60)
-        print(" Phase 3: JAX + AdamW 微調整")
+        print(" Phase 3: スキップ（FLC形状学習後は微調整不要）")
         print("="*60)
+        print("  Phase 1.5で十分に最適化済み")
     
-    # Phase2結果から再初期化（安全な逆変換）
-    def safe_logit(x, x_min, x_max):
-        """安全なlogit変換"""
-        eps = 1e-8
-        x_scaled = (x - x_min) / (x_max - x_min)
-        x_scaled = jnp.clip(x_scaled, eps, 1 - eps)
-        return jnp.log(x_scaled / (1 - x_scaled))
-    
-    params_jax_final = {
-        'log_V0': jnp.log(edr_phase2.V0),
-        'log_av': jnp.log(edr_phase2.av),
-        'log_ad': jnp.log(edr_phase2.ad),
-        'logit_chi': safe_logit(edr_phase2.chi, 0.05, 0.3),
-        'logit_K_scale': safe_logit(edr_phase2.K_scale, 0.05, 1.0),
-        'logit_K_scale_draw': safe_logit(edr_phase2.K_scale_draw, 0.05, 0.3),
-        'logit_K_scale_plane': safe_logit(edr_phase2.K_scale_plane, 0.1, 0.4),
-        'logit_K_scale_biax': safe_logit(edr_phase2.K_scale_biax, 0.05, 0.3),
-        'logit_triax_sens': safe_logit(edr_phase2.triax_sens, 0.1, 0.5),
-        'Lambda_crit': jnp.array(edr_phase2.Lambda_crit),
-        'logit_beta_A': safe_logit(edr_phase2.beta_A, 0.2, 0.5),
-        'logit_beta_bw': safe_logit(edr_phase2.beta_bw, 0.2, 0.35),
-        'logit_beta_A_pos': safe_logit(edr_phase2.beta_A_pos, 0.3, 0.7),
-    }
-    
-    # 微調整用オプティマイザ（低学習率）
-    optimizer_fine = optax.adamw(learning_rate=5e-4, weight_decay=1e-5)
-    opt_state_fine = optimizer_fine.init(params_jax_final)
-    
-    for step in range(300):
-        grads = grad_fn(params_jax_final, exps, mat)
-        updates, opt_state_fine = optimizer_fine.update(grads, opt_state_fine, params_jax_final)
-        params_jax_final = optax.apply_updates(params_jax_final, updates)
-        
-        if step % 100 == 0 and verbose:
-            loss = loss_fn_jax(params_jax_final, exps, mat)
-            print(f"  Step {step:3d}: Loss = {loss:.6f}")
-    
-    # 最終結果
-    edr_dict_final = transform_params_jax(params_jax_final)
-    edr_final = edr_dict_to_dataclass(edr_dict_final)
-    
-    final_loss = loss_fn_jax(params_jax_final, exps, mat)
+    # Phase 1.5（またはPhase 2）の結果をそのまま使用
+    if 'params_flc' in locals():
+        # Phase 1.5実行時
+        edr_dict_final = transform_params_jax(params_flc)
+        edr_final = edr_dict_to_dataclass(edr_dict_final)
+        final_loss = loss_flc_true_jax(params_flc, flc_pts_data, mat_dict)
+    else:
+        # Phase 1.5スキップ時はPhase 2の結果を使用
+        edr_final = edr_phase2
+        final_loss = 0.0
     
     info = {
         'success': True,
