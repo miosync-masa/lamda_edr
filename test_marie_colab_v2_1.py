@@ -321,7 +321,7 @@ print(" 🎂 最適化されたEDRパラメータ")
 print("="*80)
 
 # Phase 1.5B後のパラメータを取得
-final_params = results.get('phase15b_params', results.get('phase0_params'))
+final_params = results.get('params_final') 
 if final_params is not None:
     edr_final = transform_params_jax(final_params)
     
