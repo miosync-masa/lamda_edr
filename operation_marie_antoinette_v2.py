@@ -340,10 +340,11 @@ def phase0_unsupervised_learning(
 def build_safe_manifold(
     mat_dict: Dict,
     edr_dict: Dict,
-    simulate_fn=None,  # デフォルトでedr_fit.pyのものを使用
+    simulate_fn=None,
     n_beta: int = 15,
     n_mu: int = 5,
     n_pN: int = 5,
+    duration: float = 0.6,  # ← 引数として追加！デフォルトは0.6に
     safety_margin: float = 0.85,
     verbose: bool = True
 ):
@@ -813,6 +814,7 @@ def marie_antoinette_pipeline(
         n_beta=manifold_params['n_beta'],
         n_mu=manifold_params['n_mu'],
         n_pN=manifold_params['n_pN'],
+        duration=0.6,
         safety_margin=0.85,
         verbose=verbose
     )
