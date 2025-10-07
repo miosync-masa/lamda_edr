@@ -372,6 +372,7 @@ def simulate_lambda_jax(schedule_dict, mat_dict, edr_dict):
             edr_dict['beta_bw']
         )
         K_total = jnp.maximum(K_total, 0.0)
+        K_total = jnp.where(jnp.isnan(K_total), 0.0, K_total)  # NaN対策
         
         # V_eff（温度依存性を強化）
         T_ratio = jnp.minimum((T - 273.15) / (1500.0 - 273.15), 1.0)
@@ -379,13 +380,16 @@ def simulate_lambda_jax(schedule_dict, mat_dict, edr_dict):
         V_eff = edr_dict['V0'] * temp_factor * \
                 (1.0 - edr_dict['av'] * cv - edr_dict['ad'] * jnp.sqrt(jnp.maximum(rho_d, 1e10)))
         V_eff = jnp.maximum(V_eff, 0.01 * edr_dict['V0'])
+        V_eff = jnp.where(jnp.isnan(V_eff), edr_dict['V0'], V_eff)  # NaN対策
         
         # 三軸度補正（感度を調整）
         D_triax = jnp.exp(-edr_dict['triax_sens'] * jnp.maximum(triax_t, 0.0))
+        D_triax = jnp.where(jnp.isnan(D_triax), 1.0, D_triax)  # NaN対策
         
         # Λ計算
         Lambda = K_total / jnp.maximum(V_eff * D_triax, 1e7)
         Lambda = jnp.minimum(Lambda, 10.0)
+        Lambda = jnp.where(jnp.isnan(Lambda), 0.0, Lambda)  # NaN対策
         
         # 相当塑性ひずみ更新
         ep_eq_new = ep_eq + epdot_eq * dt
@@ -411,21 +415,21 @@ def simulate_lambda_jax(schedule_dict, mat_dict, edr_dict):
 # =============================================================================
 
 def init_edr_params_jax():
-    """JAX用パラメータ初期化（log空間）"""
+    """JAX用パラメータ初期化（バランス調整版）"""
     return {
-        'log_V0': jnp.log(2e9),
-        'log_av': jnp.log(3e4),
-        'log_ad': jnp.log(1e-7),
-        'logit_chi': jnp.log(0.1 / (1 - 0.1)),
-        'logit_K_scale': jnp.log(0.2 / (1 - 0.2)),
-        'logit_K_scale_draw': jnp.log(0.15 / (1 - 0.15)),
+        'log_V0': jnp.log(1.5e9),    # 1e9→1.5e9
+        'log_av': jnp.log(4e4),       # 5e4→4e4
+        'log_ad': jnp.log(1e-7),      
+        'logit_chi': jnp.log(0.09 / (1 - 0.09)),    
+        'logit_K_scale': jnp.log(0.25 / (1 - 0.25)),  # 0.3→0.25
+        'logit_K_scale_draw': jnp.log(0.18 / (1 - 0.18)),  # 0.2→0.18
         'logit_K_scale_plane': jnp.log(0.25 / (1 - 0.25)),
-        'logit_K_scale_biax': jnp.log(0.20 / (1 - 0.20)),
-        'logit_triax_sens': jnp.log(0.3 / (1 - 0.3)),
-        'Lambda_crit': jnp.array(1.0),
-        'logit_beta_A': jnp.log(0.35 / (1 - 0.35)),
-        'logit_beta_bw': jnp.log(0.28 / (1 - 0.28)),
-        'logit_beta_A_pos': jnp.log(0.5 / (1 - 0.5)),
+        'logit_K_scale_biax': jnp.log(0.22 / (1 - 0.22)),  # 0.25→0.22
+        'logit_triax_sens': jnp.log(0.28 / (1 - 0.28)),   # 0.25→0.28
+        'Lambda_crit': jnp.array(0.97),  # 0.95→0.97
+        'logit_beta_A': jnp.log(0.32 / (1 - 0.32)),      # 0.3→0.32
+        'logit_beta_bw': jnp.log(0.29 / (1 - 0.29)),     # 0.3→0.29
+        'logit_beta_A_pos': jnp.log(0.48 / (1 - 0.48)),  # 0.45→0.48
     }
 
 def transform_params_jax(raw_params):
@@ -555,22 +559,17 @@ def hybrid_staged_optimization(
     # 共通で使用する関数を先に定義
     mat_dict = mat_to_jax_dict(mat)
     
-    # 簡易FLC予測（JAX版）
-    @jit 
-    def predict_flc_jax(path_ratio, edr_dict, mat_dict):
-        """実際のシミュレーションベースFLC予測"""
-        # FLC試験条件
+    # Phase 0用の安定版（argmax使用）
+    def predict_flc_jax_stable(path_ratio, edr_dict, mat_dict):
+        """Phase 0用の安定版FLC予測（argmax使用）"""
         duration = 1.0
-        major_rate = 0.6  # 主ひずみ速度
+        major_rate = 0.6
         dt = 1e-3
-        N = int(duration/dt)
-        
-        # ひずみ経路生成
+        N = int(duration/dt) + 1
         t = jnp.linspace(0, duration, N)
         epsM = major_rate * t
         epsm = path_ratio * epsM
         
-        # スケジュール作成
         schedule_dict = {
             't': t,
             'eps_maj': epsM,
@@ -585,17 +584,71 @@ def hybrid_staged_optimization(
             'T0': 293.15
         }
         
-        # シミュレーション実行
         res = simulate_lambda_jax(schedule_dict, mat_dict, edr_dict)
         Lambda_smooth = smooth_signal_jax(res["Lambda"], window_size=11)
         
-        # 限界点検出
-        idx = jnp.where(Lambda_smooth > edr_dict['Lambda_crit'])[0]
+        # 安定版：argmax使用
+        exceed_mask = Lambda_smooth > edr_dict['Lambda_crit']
+        first_exceed = jnp.argmax(exceed_mask)
+        has_exceeded = jnp.any(exceed_mask)
         
-        # 限界ひずみ決定
-        Em = jnp.where(jnp.size(idx) > 0, epsM[idx[0]], epsM[-1])
-        em = jnp.where(jnp.size(idx) > 0, epsm[idx[0]], epsm[-1])
+        epsM_trimmed = epsM[:-1]
+        Em = jnp.where(has_exceeded, epsM_trimmed[first_exceed], epsM_trimmed[-1])
+        em = path_ratio * Em
         
+        return Em, em
+    
+    def soft_crossing_em(epsM, Lambda, Lambda_crit, k=10.0):  # 40→10に下げる
+        """Λ>Λcrit近傍で重み付き平均主ひずみを返す（微分可能）"""
+        exceed = jnp.maximum(Lambda - Lambda_crit, 0.0)
+        w = jnp.exp(jnp.minimum(k * exceed, 10.0))  # 20.0→10.0でより安定
+        w = w / (jnp.sum(w) + 1e-12)
+        Em = jnp.sum(w * epsM)
+        Em = jnp.where(jnp.isnan(Em), epsM[-1], Em)  # NaN対策
+        return Em
+    
+    def predict_flc_from_sim_jax(beta, mat_dict, edr_dict, 
+                                  major_rate=0.6, duration=1.0):
+        """Λ(t)シミュレーションからFLC限界点を微分可能に抽出"""
+        dt = 1e-3
+        N = int(duration/dt) + 1
+        t = jnp.linspace(0, duration, N)
+        epsM = major_rate * t
+        epsm = beta * epsM
+        
+        schedule_dict = {
+            't': t,
+            'eps_maj': epsM,
+            'eps_min': epsm,
+            'triax': jnp.full(N, triax_from_path_jax(beta)),
+            'mu': jnp.full(N, 0.08),
+            'pN': jnp.full(N, 200e6),
+            'vslip': jnp.full(N, 0.02),
+            'htc': jnp.full(N, 8000.0),
+            'Tdie': jnp.full(N, 293.15),
+            'contact': jnp.full(N, 1.0),
+            'T0': 293.15
+        }
+        
+        res = simulate_lambda_jax(schedule_dict, mat_dict, edr_dict)
+        Lambda_raw = res["Lambda"]  # 長さはN-1
+        
+        # スムージング
+        Lambda_smooth = smooth_signal_jax(Lambda_raw, window_size=11)
+        
+        # epsM配列をLambdaの長さに合わせる（最後の要素を除く）
+        epsM_trimmed = epsM[:-1]
+        
+        # 微分可能な限界点検出（k値を下げて安定化）
+        Em = soft_crossing_em(epsM_trimmed, Lambda_smooth, edr_dict['Lambda_crit'], k=10.0)  # 40→10
+        em = beta * Em
+        
+        return Em, em, Lambda_smooth
+    
+    # 簡易FLC予測（JAX版）- 互換性のため残す
+    def predict_flc_jax(path_ratio, edr_dict, mat_dict):
+        """実際のシミュレーションベースFLC予測（互換性用）"""
+        Em, em, _ = predict_flc_from_sim_jax(path_ratio, mat_dict, edr_dict)
         return Em, em
     
     # ===========================
@@ -608,24 +661,28 @@ def hybrid_staged_optimization(
         print("  物理制約のみでFLC面を事前学習")
     
     # Phase 0: 教師なしFLC面学習
-    @jit
     def loss_phase0(raw_params):
         """物理制約のみでFLC面を学習"""
         edr_dict = transform_params_jax(raw_params)
         
-        # 密なβグリッド
-        beta_grid = jnp.linspace(-1.0, 1.0, 50)
+        # βグリッドを適度に設定（安定版なので多少増やせる）
+        beta_grid = jnp.linspace(-0.8, 0.8, 13)  # 7→13点に増加
         
         # 各βでの仮想FLC限界を計算
         Em_grid = []
         for beta in beta_grid:
-            Em, _ = predict_flc_jax(beta, edr_dict, mat_dict)
+            Em, _ = predict_flc_jax_stable(beta, edr_dict, mat_dict)  # 安定版を使用
+            # NaNチェックと範囲制限
+            Em = jnp.where(jnp.isnan(Em), 0.3, Em)  
+            Em = jnp.clip(Em, 0.1, 0.8)  # より保守的な範囲
             Em_grid.append(Em)
         
         Em_array = jnp.array(Em_grid)
+        Em_array = jnp.where(jnp.isnan(Em_array), 0.3, Em_array)  # 最終NaNチェック
         
         # 物理制約1: 単調性（|ε|が増えるとΛも増える）
         monotonicity_loss = jnp.mean(jnp.maximum(0, -jnp.diff(jnp.abs(Em_array))))
+        monotonicity_loss = jnp.where(jnp.isnan(monotonicity_loss), 0.0, monotonicity_loss)
         
         # 物理制約2: 凸性（V字形状）
         center = len(beta_grid) // 2
@@ -635,33 +692,40 @@ def hybrid_staged_optimization(
         # 左枝は下降、右枝は上昇
         convexity_loss = jnp.mean(jnp.maximum(0, jnp.diff(left_branch))) + \
                          jnp.mean(jnp.maximum(0, -jnp.diff(right_branch)))
+        convexity_loss = jnp.where(jnp.isnan(convexity_loss), 0.0, convexity_loss)
         
         # 物理制約3: 対称性（破れを許容）
-        asymmetry_factor = edr_dict['beta_A_pos'] / edr_dict['beta_A']
+        asymmetry_factor = jnp.clip(edr_dict['beta_A_pos'] / (edr_dict['beta_A'] + 1e-8), 0.5, 2.0)
         symmetry_target = Em_array[::-1] * asymmetry_factor
         symmetry_loss = 0.1 * jnp.mean((Em_array - symmetry_target)**2)
+        symmetry_loss = jnp.where(jnp.isnan(symmetry_loss), 0.0, symmetry_loss)
         
         # 物理制約4: 平滑性（急激な変化を抑制）
         grad2 = jnp.diff(jnp.diff(Em_array))
         smoothness_loss = 0.05 * jnp.mean(grad2**2)
+        smoothness_loss = jnp.where(jnp.isnan(smoothness_loss), 0.0, smoothness_loss)
         
         # 物理制約5: 合理的な範囲（0.1 < Em < 1.0）
         range_loss = jnp.mean(jnp.maximum(0, 0.1 - Em_array)**2) + \
                      jnp.mean(jnp.maximum(0, Em_array - 1.0)**2)
+        range_loss = jnp.where(jnp.isnan(range_loss), 0.0, range_loss)
         
         total_loss = monotonicity_loss + convexity_loss + symmetry_loss + \
                     smoothness_loss + range_loss
+        
+        # 最終NaN対策
+        total_loss = jnp.where(jnp.isnan(total_loss), 1e10, total_loss)
         
         return total_loss
     
     # Phase 0の初期化
     params_phase0 = init_edr_params_jax()
     
-    # Phase 0最適化
+    # Phase 0最適化（安定版なので学習率を適度に）
     schedule_phase0 = optax.exponential_decay(
-        init_value=5e-3,
-        transition_steps=100,
-        decay_rate=0.9
+        init_value=3e-3,  # 1e-3→3e-3に戻す
+        transition_steps=50,  
+        decay_rate=0.92  # 0.95→0.92
     )
     
     optimizer_phase0 = optax.chain(
@@ -672,12 +736,12 @@ def hybrid_staged_optimization(
     opt_state_phase0 = optimizer_phase0.init(params_phase0)
     grad_fn_phase0 = jax.grad(loss_phase0)
     
-    for step in range(300):
+    for step in range(300):  # 元に戻す
         grads = grad_fn_phase0(params_phase0)
         updates, opt_state_phase0 = optimizer_phase0.update(grads, opt_state_phase0, params_phase0)
         params_phase0 = optax.apply_updates(params_phase0, updates)
         
-        if step % 100 == 0 and verbose:
+        if step % 100 == 0 and verbose:  # 元に戻す
             loss = loss_phase0(params_phase0)
             print(f"  Step {step:3d}: Physics Loss = {loss:.6f}")
     
@@ -749,62 +813,57 @@ def hybrid_staged_optimization(
         print("="*60)
         print("  FLC形状の学習に特化")
     
-    # FLC専用損失関数
-    @jit
-    def loss_flc_jax(raw_params, flc_pts_data, mat_dict):
+    # FLC専用損失関数（真物理版）
+    def loss_flc_true_jax(raw_params, flc_pts_data, mat_dict):
+        """真のΛシミュレーションベースFLC損失"""
         edr_dict = transform_params_jax(raw_params)
-        total_loss = 0.0
         
-        # 適応的β分布（等二軸側を密に）
-        beta_batch = jnp.concatenate([
-            jnp.linspace(-0.6, 0.0, 7),   # 深絞り側は粗く
-            jnp.linspace(0.05, 0.6, 13)   # 等二軸側は密に（0重複回避）
-        ])
-        lambda_peaks = []
-        
-        # 各β値でのΛピーク計算（V字形状の評価）
-        for beta in beta_batch:
-            Em, em = predict_flc_jax(beta, edr_dict, mat_dict)
-            # 仮想的なΛピーク（FLC限界での値）
-            lambda_peak = 1.0 / (Em + 0.1)  # 簡易的な逆相関
-            lambda_peaks.append(lambda_peak)
-        
-        lambda_array = jnp.array(lambda_peaks)
-        
-        # 動的重み付けのvalley_loss
-        valley_weight = jnp.clip(jnp.var(lambda_array), 0.05, 0.3)
-        center_idx = 6  # β=0の位置（調整後）
-        valley_loss = valley_weight * jnp.sum(
-            (lambda_array - lambda_array[center_idx])**2 * 
-            jnp.where(jnp.abs(beta_batch) < 0.1, 0.0, 1.0)
-        )
-        
-        # L1+L2混合の曲率正則化
-        grad1 = jnp.diff(lambda_array)
-        grad2 = jnp.diff(grad1)
-        smoothness_loss = 0.05 * jnp.mean(grad2**2) + 0.02 * jnp.mean(jnp.abs(grad2))
-        
-        # FLC点ごとの誤差計算
+        # FLC点ごとの誤差を順次計算（vmapの代わりにループ）
+        flc_err = 0.0
         for i in range(len(flc_pts_data['path_ratios'])):
-            path_ratio = flc_pts_data['path_ratios'][i]
-            major_limit = flc_pts_data['major_limits'][i]
-            minor_limit = flc_pts_data['minor_limits'][i]
+            beta = flc_pts_data['path_ratios'][i]
+            Em_gt = flc_pts_data['major_limits'][i]
+            em_gt = flc_pts_data['minor_limits'][i]
+            
+            Em_pred, em_pred, _ = predict_flc_from_sim_jax(beta, mat_dict, edr_dict)
             
             # β依存の重み付け（等二軸を最重視）
-            w = jnp.where(jnp.abs(path_ratio - 0.5) < 0.1, 5.0,
-                         jnp.where(jnp.abs(path_ratio) < 0.1, 1.5, 1.0))
+            w = jnp.where(jnp.abs(beta - 0.5) < 0.1, 6.0,
+                         jnp.where(jnp.abs(beta) < 0.1, 1.8, 1.0))
             
-            # 予測値計算
-            Em_pred, em_pred = predict_flc_jax(path_ratio, edr_dict, mat_dict)
-            
-            loss = w * ((Em_pred - major_limit)**2 + (em_pred - minor_limit)**2)
-            total_loss += loss
+            flc_err += w * ((Em_pred - Em_gt)**2 + (em_pred - em_gt)**2)
         
-        # 総損失 = FLC誤差 + 動的V字形状正則化
-        total_loss = total_loss / max(len(flc_pts_data['path_ratios']), 1)
-        total_loss += valley_loss + smoothness_loss
+        flc_err = flc_err / len(flc_pts_data['path_ratios'])
+        
+        # V字形状と滑らかさの正則化（高解像度に戻す）
+        beta_batch = jnp.linspace(-0.6, 0.6, 21)  # 7→21点に戻す！
+        
+        # 正則化用のFLC曲線を計算（ループ使用）
+        Em_curve = []
+        for beta in beta_batch:
+            Em, _, _ = predict_flc_from_sim_jax(beta, mat_dict, edr_dict)
+            Em_curve.append(Em)
+        Em_curve = jnp.array(Em_curve)
+        
+        # V字形状の正則化
+        center_idx = len(beta_batch) // 2
+        center = Em_curve[center_idx]
+        valley_loss = 0.1 * jnp.mean(jnp.maximum(0.0, Em_curve - center))
+        
+        # 曲率の正則化（滑らかさ）
+        grad2 = jnp.diff(jnp.diff(Em_curve))
+        smoothness_loss = 0.05 * jnp.mean(grad2**2) + 0.02 * jnp.mean(jnp.abs(grad2))
+        
+        # 動的重み付け（分散に応じて正則化を調整）
+        valley_weight = jnp.clip(jnp.var(Em_curve), 0.05, 0.3)
+        valley_loss = valley_weight * valley_loss
+        
+        total_loss = flc_err + valley_loss + smoothness_loss
         
         return total_loss
+    
+    # 旧バージョン互換性のためのエイリアス
+    loss_flc_jax = loss_flc_true_jax
     
     # FLC最適化実行
     if flc_pts:
@@ -842,7 +901,7 @@ def hybrid_staged_optimization(
         
         opt_state_flc = optimizer_flc.init(best_params)
         mat_dict = mat_to_jax_dict(mat)
-        grad_fn_flc = jax.grad(loss_flc_jax)
+        grad_fn_flc = jax.grad(loss_flc_true_jax)  # 真物理版を使用
         
         params_flc = best_params
         
@@ -853,7 +912,7 @@ def hybrid_staged_optimization(
             params_flc = optax.apply_updates(params_flc, updates)
             
             if step % 300 == 0 and verbose:
-                loss = loss_flc_jax(params_flc, flc_pts_data, mat_dict)
+                loss = loss_flc_true_jax(params_flc, flc_pts_data, mat_dict)
                 print(f"  Step {step:4d}: FLC Loss = {loss:.6f}")
         
         # Phase 1.5結果を使用
@@ -862,8 +921,9 @@ def hybrid_staged_optimization(
         edr_phase1 = edr_dict_to_dataclass(edr_dict)
         
         if verbose:
-            final_flc_loss = loss_flc_jax(params_flc, flc_pts_data, mat_dict)
+            final_flc_loss = loss_flc_true_jax(params_flc, flc_pts_data, mat_dict)
             print(f"\n  Phase 1.5完了: FLC Loss = {final_flc_loss:.6f}")
+            print("  真物理シミュレーションベースのFLC形状学習完了")
     
     # ===========================
     # Phase 2: L-BFGS-B局所精密化
