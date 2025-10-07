@@ -405,7 +405,6 @@ def build_safe_manifold(
                 count += 1
                 
                 # 安全なスケジュール生成（低負荷）
-                duration = 0.8
                 major_rate = 0.4  # 低ひずみ速度
                 dt = 1e-3
                 N = int(duration/dt) + 1
