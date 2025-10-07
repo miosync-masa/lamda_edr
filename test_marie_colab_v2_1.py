@@ -233,8 +233,8 @@ manifold_weights = {
 }
 
 correct = 0
-safety_threshold = 0.3
-danger_threshold = 0.5
+safe_threshold = 0.25   # 0.3 → 0.25
+danger_threshold = 0.35  # 0.5 → 0.35
 
 for i, exp in enumerate(exps):
     schedule_dict = schedule_to_jax_dict(exp.schedule)
