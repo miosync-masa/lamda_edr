@@ -754,192 +754,209 @@ def hybrid_staged_optimization(
     params_jax = params_phase0
     
     # ===========================
-    # Phase 1: AdamW広域探索
+    # Phase 1: FLC形状確立＋段階的バイナリ統合
     # ===========================
     if verbose:
         print("\n" + "="*60)
-        print(" Phase 1: JAX + AdamW 広域探索")
+        print(" Phase 1: FLC形状確立＋段階的バイナリ統合")
         print("="*60)
-        print("  Phase 0で学習したFLC面を基に、バイナリ分類を最適化")
+        print("  FLCを基礎として段階的にバイナリ性能を積み上げ")
     
-    # オプティマイザ設定
-    schedule = optax.warmup_cosine_decay_schedule(
-        init_value=1e-2,
-        peak_value=1e-2,
-        warmup_steps=100,
-        decay_steps=1900,
-        end_value=1e-4
-    )
+    # Phase 0の結果を使用
+    params_main = params_phase0.copy()
+    mat_dict = mat_to_jax_dict(mat)
     
-    optimizer = optax.chain(
-        optax.clip_by_global_norm(1.0),
-        optax.adamw(learning_rate=schedule, weight_decay=1e-3, b1=0.9, b2=0.999)
-    )
-    
-    opt_state = optimizer.init(params_jax)
-    grad_fn = jax.grad(loss_fn_jax)
-    
-    # 最適化ループ
-    best_loss = float('inf')
-    best_params = params_jax
-    
-    for step in range(2000):
-        grads = grad_fn(params_jax, exps, mat)
-        updates, opt_state = optimizer.update(grads, opt_state, params_jax)
-        params_jax = optax.apply_updates(params_jax, updates)
-        
-        if step % 100 == 0:
-            loss = loss_fn_jax(params_jax, exps, mat)
-            if loss < best_loss:
-                best_loss = loss
-                best_params = params_jax
-            
-            if verbose:
-                print(f"  Step {step:4d}: Loss = {loss:.6f}")
-    
-    # Phase 1結果を変換
-    edr_dict = transform_params_jax(best_params)
-    edr_phase1 = edr_dict_to_dataclass(edr_dict)
-    
-    if verbose:
-        print(f"\n  Phase 1完了: 最終Loss = {best_loss:.6f}")
-    
-    # ===========================
-    # Phase 1.5: FLC Shaping
-    # ===========================
-    if flc_pts and verbose:
-        print("\n" + "="*60)
-        print(" Phase 1.5: FLC Shaping (AdamW)")
-        print("="*60)
-        print("  FLC形状の学習に特化")
-    
-    # FLC専用損失関数（真物理版）
-    def loss_flc_true_jax(raw_params, flc_pts_data, mat_dict):
-        """真のΛシミュレーションベースFLC損失"""
-        edr_dict = transform_params_jax(raw_params)
-        
-        # FLC点ごとの誤差を順次計算（vmapの代わりにループ）
-        flc_err = 0.0
-        for i in range(len(flc_pts_data['path_ratios'])):
-            beta = flc_pts_data['path_ratios'][i]
-            Em_gt = flc_pts_data['major_limits'][i]
-            em_gt = flc_pts_data['minor_limits'][i]
-            
-            Em_pred, em_pred, _ = predict_flc_from_sim_jax(beta, mat_dict, edr_dict)
-            
-            # β依存の重み付け（等二軸を最重視）
-            w = jnp.where(jnp.abs(beta - 0.5) < 0.1, 6.0,
-                         jnp.where(jnp.abs(beta) < 0.1, 1.8, 1.0))
-            
-            flc_err += w * ((Em_pred - Em_gt)**2 + (em_pred - em_gt)**2)
-        
-        flc_err = flc_err / len(flc_pts_data['path_ratios'])
-        
-        # V字形状と滑らかさの正則化（高解像度に戻す）
-        beta_batch = jnp.linspace(-0.6, 0.6, 21)  # 7→21点に戻す！
-        
-        # 正則化用のFLC曲線を計算（ループ使用）
-        Em_curve = []
-        for beta in beta_batch:
-            Em, _, _ = predict_flc_from_sim_jax(beta, mat_dict, edr_dict)
-            Em_curve.append(Em)
-        Em_curve = jnp.array(Em_curve)
-        
-        # V字形状の正則化
-        center_idx = len(beta_batch) // 2
-        center = Em_curve[center_idx]
-        valley_loss = 0.1 * jnp.mean(jnp.maximum(0.0, Em_curve - center))
-        
-        # 曲率の正則化（滑らかさ）
-        grad2 = jnp.diff(jnp.diff(Em_curve))
-        smoothness_loss = 0.05 * jnp.mean(grad2**2) + 0.02 * jnp.mean(jnp.abs(grad2))
-        
-        # 動的重み付け（分散に応じて正則化を調整）
-        valley_weight = jnp.clip(jnp.var(Em_curve), 0.05, 0.3)
-        valley_loss = valley_weight * valley_loss
-        
-        total_loss = flc_err + valley_loss + smoothness_loss
-        
-        return total_loss
-    
-    # 旧バージョン互換性のためのエイリアス
-    loss_flc_jax = loss_flc_true_jax
-    
-    # FLC最適化実行
+    # FLCデータ準備
     if flc_pts:
         # 仮想FLC点を追加（データ増強）
         virtual_flc_pts = [
-            FLCPoint(-0.3, 0.32, -0.096, 0.6, 1.0, "virtual_1"),  # 深絞り-平面の中間
-            FLCPoint(0.3, 0.25, 0.075, 0.6, 1.0, "virtual_2"),    # 平面-等二軸の中間
-            FLCPoint(-0.7, 0.38, -0.266, 0.6, 1.0, "virtual_3"),  # より深絞り側
-            FLCPoint(0.7, 0.18, 0.126, 0.6, 1.0, "virtual_4"),    # より等二軸側
+            FLCPoint(-0.3, 0.32, -0.096, 0.6, 1.0, "virtual_1"),
+            FLCPoint(0.3, 0.25, 0.075, 0.6, 1.0, "virtual_2"),
+            FLCPoint(-0.7, 0.38, -0.266, 0.6, 1.0, "virtual_3"),
+            FLCPoint(0.7, 0.18, 0.126, 0.6, 1.0, "virtual_4"),
         ]
         
-        # 実データと仮想データを結合
         all_flc_pts = flc_pts + virtual_flc_pts
-        
-        # FLCデータをJAX形式に変換
         flc_pts_data = {
             'path_ratios': jnp.array([p.path_ratio for p in all_flc_pts]),
             'major_limits': jnp.array([p.major_limit for p in all_flc_pts]),
             'minor_limits': jnp.array([p.minor_limit for p in all_flc_pts])
         }
+    
+    # Step 1.1: β系確立（FLC 100%）
+    if verbose:
+        print("\n--- Step 1.1: β系確立（FLC形状の基礎） ---")
+        print("  最適化: beta_A, beta_bw, beta_A_pos")
+        print("  損失: FLC 100%")
+    
+    beta_keys = ['logit_beta_A', 'logit_beta_bw', 'logit_beta_A_pos']
+    
+    def loss_step1(params):
+        # β系のみ最適化、他は固定
+        active_params = {k: params[k] for k in beta_keys}
+        params_temp = params_main.copy()
+        params_temp.update(active_params)
         
-        # 学習率を高めに設定（warmup付き、強化版）
-        schedule_flc = optax.warmup_cosine_decay_schedule(
-            init_value=2e-3,
-            peak_value=5e-3,  # より積極的な学習
-            warmup_steps=200,
-            decay_steps=1300,
-            end_value=5e-4
-        )
+        # FLC損失のみ
+        return loss_flc_true_jax(params_temp, flc_pts_data, mat_dict)
+    
+    # AdamWで最適化
+    beta_params = {k: params_main[k] for k in beta_keys}
+    optimizer = optax.adamw(learning_rate=1e-2, weight_decay=1e-4)
+    opt_state = optimizer.init(beta_params)
+    grad_fn = jax.grad(loss_step1)
+    
+    for step in range(300):
+        grads = grad_fn(beta_params)
+        updates, opt_state = optimizer.update(grads, opt_state, beta_params)
+        beta_params = optax.apply_updates(beta_params, updates)
         
-        optimizer_flc = optax.chain(
-            optax.clip_by_global_norm(0.3),  # より小さいclip
-            optax.adamw(learning_rate=schedule_flc, weight_decay=5e-5)
-        )
+        if step % 100 == 0 and verbose:
+            loss = loss_step1(beta_params)
+            print(f"    Step {step}: FLC Loss = {loss:.6f}")
+    
+    params_main.update(beta_params)
+    
+    # Step 1.2: K_scale系追加（FLC 90% + Binary 10%）
+    if verbose:
+        print("\n--- Step 1.2: K_scale系追加 ---")
+        print("  最適化: K_scale_draw/plane/biax, triax_sens")
+        print("  損失: FLC 90% + Binary 10%")
+    
+    k_keys = ['logit_K_scale', 'logit_K_scale_draw', 
+              'logit_K_scale_plane', 'logit_K_scale_biax', 'logit_triax_sens']
+    
+    def loss_step2(params):
+        # K系のみ最適化、β系は固定
+        active_params = {k: params[k] for k in k_keys}
+        params_temp = params_main.copy()
+        params_temp.update(active_params)
         
-        opt_state_flc = optimizer_flc.init(best_params)
-        mat_dict = mat_to_jax_dict(mat)
-        grad_fn_flc = jax.grad(loss_flc_true_jax)  # 真物理版を使用
+        # FLC 90% + Binary 10%
+        flc_loss = loss_flc_true_jax(params_temp, flc_pts_data, mat_dict)
+        bin_loss = loss_fn_jax(params_temp, exps, mat)
+        return 0.9 * flc_loss + 0.1 * bin_loss
+    
+    k_params = {k: params_main[k] for k in k_keys}
+    optimizer = optax.adamw(learning_rate=8e-3, weight_decay=1e-3)
+    opt_state = optimizer.init(k_params)
+    grad_fn = jax.grad(loss_step2)
+    
+    for step in range(300):
+        grads = grad_fn(k_params)
+        updates, opt_state = optimizer.update(grads, opt_state, k_params)
+        k_params = optax.apply_updates(k_params, updates)
         
-        params_flc = best_params
+        if step % 100 == 0 and verbose:
+            loss = loss_step2(k_params)
+            print(f"    Step {step}: Mixed Loss = {loss:.6f}")
+    
+    params_main.update(k_params)
+    
+    # Step 1.3: V系追加（FLC 70% + Binary 30%）
+    if verbose:
+        print("\n--- Step 1.3: V系追加 ---")
+        print("  最適化: V0, av, ad, chi")
+        print("  損失: FLC 70% + Binary 30%")
+    
+    v_keys = ['log_V0', 'log_av', 'log_ad', 'logit_chi']
+    
+    def loss_step3(params):
+        # V系のみ最適化、β系・K系は固定
+        active_params = {k: params[k] for k in v_keys}
+        params_temp = params_main.copy()
+        params_temp.update(active_params)
         
-        # ステップ数を大幅増加
-        for step in range(1500):
-            # FLC損失とバイナリ損失の混合
-            if step < 1000:
-                # 最初はFLC損失のみ
-                grads = grad_fn_flc(params_flc, flc_pts_data, mat_dict)
-            else:
-                # 後半はバイナリ損失も少し混ぜる（10:1の比率）
-                grads_flc = grad_fn_flc(params_flc, flc_pts_data, mat_dict)
-                grads_bin = grad_fn(params_flc, exps, mat)
-                grads = jax.tree_map(lambda g1, g2: 0.9 * g1 + 0.1 * g2, grads_flc, grads_bin)
-            
-            updates, opt_state_flc = optimizer_flc.update(grads, opt_state_flc, params_flc)
-            params_flc = optax.apply_updates(params_flc, updates)
-            
-            if step % 300 == 0 and verbose:
-                loss = loss_flc_true_jax(params_flc, flc_pts_data, mat_dict)
-                if step >= 1000:
-                    bin_loss = loss_fn_jax(params_flc, exps, mat)
-                    print(f"  Step {step:4d}: FLC Loss = {loss:.6f}, Binary Loss = {bin_loss:.6f}")
-                else:
-                    print(f"  Step {step:4d}: FLC Loss = {loss:.6f}")
+        # FLC 70% + Binary 30%
+        flc_loss = loss_flc_true_jax(params_temp, flc_pts_data, mat_dict)
+        bin_loss = loss_fn_jax(params_temp, exps, mat)
+        return 0.7 * flc_loss + 0.3 * bin_loss
+    
+    # L-BFGS-Bで精密最適化
+    from scipy.optimize import minimize
+    
+    def loss_v_numpy(v_array):
+        v_dict = {v_keys[i]: jnp.array(v_array[i]) for i in range(len(v_keys))}
+        return float(loss_step3(v_dict))
+    
+    v_init = np.array([float(params_main[k]) for k in v_keys])
+    res_v = minimize(loss_v_numpy, v_init, method='L-BFGS-B',
+                    options={'maxiter': 50, 'ftol': 1e-8})
+    
+    if verbose:
+        print(f"    L-BFGS-B: Mixed Loss = {res_v.fun:.6f}, iterations = {res_v.nit}")
+    
+    for i, key in enumerate(v_keys):
+        params_main[key] = jnp.array(res_v.x[i])
+    
+    # Step 1.4: Lambda_crit調整（FLC 50% + Binary 50%）
+    if verbose:
+        print("\n--- Step 1.4: Lambda_crit調整 ---")
+        print("  最適化: Lambda_crit")
+        print("  損失: FLC 50% + Binary 50%")
+    
+    def loss_step4(lam):
+        params_temp = params_main.copy()
+        params_temp['Lambda_crit'] = lam
         
-        # Phase 1.5結果を使用
-        best_params = params_flc
-        edr_dict = transform_params_jax(best_params)
-        edr_phase1 = edr_dict_to_dataclass(edr_dict)
+        # FLC 50% + Binary 50%
+        flc_loss = loss_flc_true_jax(params_temp, flc_pts_data, mat_dict)
+        bin_loss = loss_fn_jax(params_temp, exps, mat)
+        return 0.5 * flc_loss + 0.5 * bin_loss
+    
+    # 勾配降下で微調整
+    lam = params_main['Lambda_crit']
+    learning_rate = 2e-3
+    
+    for step in range(50):
+        grad = jax.grad(loss_step4)(lam)
+        lam = lam - learning_rate * grad
+        lam = jnp.clip(lam, 0.9, 1.1)
         
-        if verbose:
-            final_flc_loss = loss_flc_true_jax(params_flc, flc_pts_data, mat_dict)
-            print(f"\n  Phase 1.5完了: FLC Loss = {final_flc_loss:.6f}")
-            print("  真物理シミュレーションベースのFLC形状学習完了")
+        if step % 25 == 0 and verbose:
+            loss = loss_step4(lam)
+            print(f"    Step {step}: Mixed Loss = {loss:.6f}, Lambda_crit = {float(lam):.4f}")
+    
+    params_main['Lambda_crit'] = lam
+    
+    # Step 1.5: 全体微調整（FLC 30% + Binary 70%）
+    if verbose:
+        print("\n--- Step 1.5: 全体微調整 ---")
+        print("  最適化: 全パラメータ（小さい学習率）")
+        print("  損失: FLC 30% + Binary 70%")
+    
+    def loss_final(params):
+        # FLC 30% + Binary 70%
+        flc_loss = loss_flc_true_jax(params, flc_pts_data, mat_dict)
+        bin_loss = loss_fn_jax(params, exps, mat)
+        return 0.3 * flc_loss + 0.7 * bin_loss
+    
+    # 小さい学習率で全体微調整
+    optimizer_final = optax.adamw(learning_rate=1e-4, weight_decay=1e-5)
+    opt_state_final = optimizer_final.init(params_main)
+    grad_fn_final = jax.grad(loss_final)
+    
+    for step in range(200):
+        grads = grad_fn_final(params_main)
+        updates, opt_state_final = optimizer_final.update(grads, opt_state_final, params_main)
+        params_main = optax.apply_updates(params_main, updates)
+        
+        if step % 100 == 0 and verbose:
+            loss = loss_final(params_main)
+            flc_loss = loss_flc_true_jax(params_main, flc_pts_data, mat_dict)
+            bin_loss = loss_fn_jax(params_main, exps, mat)
+            print(f"    Step {step}: Total = {loss:.6f} (FLC: {flc_loss:.6f}, Binary: {bin_loss:.6f})")
+    
+    # 最終結果
+    edr_dict_final = transform_params_jax(params_main)
+    edr_final = edr_dict_to_dataclass(edr_dict_final)
+    
+    if verbose:
+        final_loss = loss_final(params_main)
+        print(f"\n  Phase 1完了: 最終Loss = {final_loss:.6f}")
     
     # ===========================
-    # Phase 2: L-BFGS-B局所精密化
+    # 最終結果の処理
     # ===========================
     
     # Phase 1が十分収束している場合はスキップ
