@@ -1,7 +1,7 @@
 """
 =============================================================================
 EDRパラメータフィッティング統合版 v5.0 (JAX + CUDA)
-Miosync, Inc. / EDR Neural Calibration Engine (IENCE)
+Miosync, Inc. / Inverse-EDR Neural Calibration Engine (IENCE)
 
 【概要】
 板材成形における破壊予測のための統一理論（EDR理論）実装
@@ -558,38 +558,43 @@ def hybrid_staged_optimization(
     # 簡易FLC予測（JAX版）
     @jit 
     def predict_flc_jax(path_ratio, edr_dict, mat_dict):
-        """簡易的なFLC限界ひずみ予測"""
-        # V字形状をβ依存パラメータで表現
-        beta_mult = beta_multiplier_asymmetric_jax(
-            path_ratio,
-            edr_dict['beta_A'],
-            edr_dict.get('beta_A_pos', edr_dict['beta_A']), 
-            edr_dict['beta_bw']
-        )
+        """実際のシミュレーションベースFLC予測"""
+        # FLC試験条件
+        duration = 1.0
+        major_rate = 0.6  # 主ひずみ速度
+        dt = 1e-3
+        N = int(duration/dt)
         
-        # 基準限界ひずみ（β=0での値）
-        base_major = 0.28  # 平面ひずみでの基準値
+        # ひずみ経路生成
+        t = jnp.linspace(0, duration, N)
+        epsM = major_rate * t
+        epsm = path_ratio * epsM
         
-        # β依存の調整
-        # 深絞り側（β=-0.5）: 増加
-        # 等二軸側（β=+0.5）: 減少（より厳しい）
-        adjust = 1.0 + 0.25 * path_ratio - 0.4 * path_ratio**2
+        # スケジュール作成
+        schedule_dict = {
+            't': t,
+            'eps_maj': epsM,
+            'eps_min': epsm,
+            'triax': jnp.full(N, triax_from_path_jax(path_ratio)),
+            'mu': jnp.full(N, 0.08),
+            'pN': jnp.full(N, 200e6),
+            'vslip': jnp.full(N, 0.02),
+            'htc': jnp.full(N, 8000.0),
+            'Tdie': jnp.full(N, 293.15),
+            'contact': jnp.full(N, 1.0),
+            'T0': 293.15
+        }
         
-        # K_scale経路別の影響
-        k_factor = jnp.where(
-            jnp.abs(path_ratio + 0.5) < 0.1, edr_dict['K_scale_draw'],
-            jnp.where(
-                jnp.abs(path_ratio) < 0.1, edr_dict['K_scale_plane'],
-                jnp.where(
-                    jnp.abs(path_ratio - 0.5) < 0.1, edr_dict['K_scale_biax'],
-                    edr_dict['K_scale']
-                )
-            )
-        )
+        # シミュレーション実行
+        res = simulate_lambda_jax(schedule_dict, mat_dict, edr_dict)
+        Lambda_smooth = smooth_signal_jax(res["Lambda"], window_size=11)
         
-        # 最終的な限界主ひずみ
-        Em = base_major * adjust / (beta_mult * k_factor + 0.5)
-        em = Em * path_ratio
+        # 限界点検出
+        idx = jnp.where(Lambda_smooth > edr_dict['Lambda_crit'])[0]
+        
+        # 限界ひずみ決定
+        Em = jnp.where(jnp.size(idx) > 0, epsM[idx[0]], epsM[-1])
+        em = jnp.where(jnp.size(idx) > 0, epsm[idx[0]], epsm[-1])
         
         return Em, em
     
@@ -803,25 +808,36 @@ def hybrid_staged_optimization(
     
     # FLC最適化実行
     if flc_pts:
+        # 仮想FLC点を追加（データ増強）
+        virtual_flc_pts = [
+            FLCPoint(-0.3, 0.32, -0.096, 0.6, 1.0, "virtual_1"),  # 深絞り-平面の中間
+            FLCPoint(0.3, 0.25, 0.075, 0.6, 1.0, "virtual_2"),    # 平面-等二軸の中間
+            FLCPoint(-0.7, 0.38, -0.266, 0.6, 1.0, "virtual_3"),  # より深絞り側
+            FLCPoint(0.7, 0.18, 0.126, 0.6, 1.0, "virtual_4"),    # より等二軸側
+        ]
+        
+        # 実データと仮想データを結合
+        all_flc_pts = flc_pts + virtual_flc_pts
+        
         # FLCデータをJAX形式に変換
         flc_pts_data = {
-            'path_ratios': jnp.array([p.path_ratio for p in flc_pts]),
-            'major_limits': jnp.array([p.major_limit for p in flc_pts]),
-            'minor_limits': jnp.array([p.minor_limit for p in flc_pts])
+            'path_ratios': jnp.array([p.path_ratio for p in all_flc_pts]),
+            'major_limits': jnp.array([p.major_limit for p in all_flc_pts]),
+            'minor_limits': jnp.array([p.minor_limit for p in all_flc_pts])
         }
         
-        # 学習率を高めに設定（warmup付き）
+        # 学習率を高めに設定（warmup付き、強化版）
         schedule_flc = optax.warmup_cosine_decay_schedule(
-            init_value=1e-3,
-            peak_value=3e-3,
-            warmup_steps=100,
-            decay_steps=400,
-            end_value=3e-4
+            init_value=2e-3,
+            peak_value=5e-3,  # より積極的な学習
+            warmup_steps=200,
+            decay_steps=1300,
+            end_value=5e-4
         )
         
         optimizer_flc = optax.chain(
-            optax.clip_by_global_norm(0.5),
-            optax.adamw(learning_rate=schedule_flc, weight_decay=1e-4)
+            optax.clip_by_global_norm(0.3),  # より小さいclip
+            optax.adamw(learning_rate=schedule_flc, weight_decay=5e-5)
         )
         
         opt_state_flc = optimizer_flc.init(best_params)
@@ -830,14 +846,15 @@ def hybrid_staged_optimization(
         
         params_flc = best_params
         
-        for step in range(500):
+        # ステップ数を大幅増加
+        for step in range(1500):
             grads = grad_fn_flc(params_flc, flc_pts_data, mat_dict)
             updates, opt_state_flc = optimizer_flc.update(grads, opt_state_flc, params_flc)
             params_flc = optax.apply_updates(params_flc, updates)
             
-            if step % 100 == 0 and verbose:
+            if step % 300 == 0 and verbose:
                 loss = loss_flc_jax(params_flc, flc_pts_data, mat_dict)
-                print(f"  Step {step:3d}: FLC Loss = {loss:.6f}")
+                print(f"  Step {step:4d}: FLC Loss = {loss:.6f}")
         
         # Phase 1.5結果を使用
         best_params = params_flc
