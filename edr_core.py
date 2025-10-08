@@ -21,7 +21,7 @@ Date: 2025-01-19
 
 import numpy as np
 from dataclasses import dataclass
-from typing import Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional 
 import jax
 import jax.numpy as jnp
 from jax import jit
