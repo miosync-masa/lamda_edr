@@ -1,0 +1,516 @@
+"""
+=============================================================================
+EDR Core Library v1.0
+Energy Dissipation & Recovery理論のコア実装
+
+板材成形における破壊予測のための基盤ライブラリ
+- データ構造定義
+- 物理計算ヘルパー
+- メインシミュレーションエンジン
+- パラメータ管理
+
+【特徴】
+- JAXによる自動微分対応
+- 純粋な物理シミュレーション機能のみ
+- フィッティング機能は別モジュール（marie_fitting.py）に分離
+
+Author: 飯泉真道 + 環
+Date: 2025-01-19
+=============================================================================
+"""
+
+import numpy as np
+from dataclasses import dataclass
+from typing import Dict, Tuple, Optional
+import jax
+import jax.numpy as jnp
+from jax import jit
+
+# JAX確認
+try:
+    print(f"✓ JAX version: {jax.__version__}")
+except ImportError:
+    raise ImportError("JAXが必要です: pip install jax jaxlib")
+
+# =============================================================================
+# Section 1: データ構造定義
+# =============================================================================
+
+@dataclass
+class MaterialParams:
+    """材料パラメータ"""
+    rho: float = 7800.0      # 密度 [kg/m3]
+    cp: float = 500.0        # 比熱 [J/kg/K]
+    k: float = 40.0          # 熱伝導率 [W/m/K]
+    thickness: float = 0.0008 # 板厚 [m]
+    sigma0: float = 600e6    # 初期降伏応力 [Pa]
+    n: float = 0.15          # 加工硬化指数
+    m: float = 0.02          # 速度感受指数
+    r_value: float = 1.0     # ランクフォード値
+
+@dataclass
+class EDRParams:
+    """EDR理論パラメータ"""
+    V0: float = 2e9            # 基準凝集エネルギー [Pa = J/m3]
+    av: float = 3e4            # 空孔影響係数
+    ad: float = 1e-7           # 転位影響係数
+    chi: float = 0.1           # 摩擦発熱の内部分配率
+    K_scale: float = 0.2       # K総量スケール
+    triax_sens: float = 0.3    # 三軸度感度
+    Lambda_crit: float = 1.0   # 臨界Λ
+    # 経路別スケール係数
+    K_scale_draw: float = 0.15   # 深絞り用
+    K_scale_plane: float = 0.25  # 平面ひずみ用
+    K_scale_biax: float = 0.20   # 等二軸用
+    # FLC V字パラメータ
+    beta_A: float = 0.35       # 谷の深さ
+    beta_bw: float = 0.28      # 谷の幅
+    # 非対称パラメータ
+    beta_A_pos: float = 0.50   # 等二軸側の深さ
+
+@dataclass
+class PressSchedule:
+    """FEM or 実験ログの時系列データ"""
+    t: np.ndarray                 # 時間 [s]
+    eps_maj: np.ndarray           # 主ひずみ
+    eps_min: np.ndarray           # 副ひずみ
+    triax: np.ndarray             # 三軸度 σm/σeq
+    mu: np.ndarray                # 摩擦係数
+    pN: np.ndarray                # 接触圧 [Pa]
+    vslip: np.ndarray             # すべり速度 [m/s]
+    htc: np.ndarray               # 熱伝達係数 [W/m2/K]
+    Tdie: np.ndarray              # 金型温度 [K]
+    contact: np.ndarray           # 接触率 [0-1]
+    T0: float = 293.15            # 板の初期温度 [K]
+
+@dataclass
+class ExpBinary:
+    """破断/安全のラベル付き実験"""
+    schedule: PressSchedule
+    failed: int                   # 1:破断, 0:安全
+    label: str = ""
+
+@dataclass
+class FLCPoint:
+    """FLC: 経路比一定での限界点（実測）"""
+    path_ratio: float            # β = eps_min/eps_maj
+    major_limit: float           # 実測限界主ひずみ
+    minor_limit: float           # 実測限界副ひずみ
+    rate_major: float = 1.0      # 主ひずみ速度 [1/s]
+    duration_max: float = 1.0    # 試験上限時間 [s]
+    label: str = ""
+
+# =============================================================================
+# Section 2: データ変換関数
+# =============================================================================
+
+def schedule_to_jax_dict(schedule: PressSchedule) -> Dict:
+    """PressSchedule → JAX用dict変換"""
+    return {
+        't': jnp.array(schedule.t),
+        'eps_maj': jnp.array(schedule.eps_maj),
+        'eps_min': jnp.array(schedule.eps_min),
+        'triax': jnp.array(schedule.triax),
+        'mu': jnp.array(schedule.mu),
+        'pN': jnp.array(schedule.pN),
+        'vslip': jnp.array(schedule.vslip),
+        'htc': jnp.array(schedule.htc),
+        'Tdie': jnp.array(schedule.Tdie),
+        'contact': jnp.array(schedule.contact),
+        'T0': schedule.T0
+    }
+
+def mat_to_jax_dict(mat: MaterialParams) -> Dict:
+    """MaterialParams → JAX用dict変換"""
+    return {
+        'rho': mat.rho,
+        'cp': mat.cp,
+        'h0': mat.thickness,
+        'sigma0': mat.sigma0,
+        'n': mat.n,
+        'm': mat.m,
+        'r_value': mat.r_value
+    }
+
+# =============================================================================
+# Section 3: 物理計算ヘルパー関数
+# =============================================================================
+
+@jit
+def soft_clamp(x, min_val, max_val):
+    """ソフト境界制約（微分可能）"""
+    return min_val + (max_val - min_val) * jax.nn.sigmoid(x)
+
+@jit
+def triax_from_path_jax(beta):
+    """ひずみ経路比βから三軸度ηを計算"""
+    b = jnp.clip(beta, -0.95, 1.0)
+    return (1.0 + b) / (jnp.sqrt(3.0) * jnp.sqrt(1.0 + b + b*b))
+
+@jit
+def equiv_strain_rate_jax(epsM_dot, epsm_dot):
+    """相当ひずみ速度"""
+    sqrt_2_3 = 0.8164965809277260
+    return sqrt_2_3 * jnp.sqrt(
+        (epsM_dot - epsm_dot)**2 + epsM_dot**2 + epsm_dot**2
+    )
+
+@jit
+def flow_stress_jax(ep_eq, epdot_eq, sigma0, n, m, r_value, T):
+    """温度依存の流動応力"""
+    Tref = 293.15
+    alpha = 3e-4
+    rate_fac = jnp.power(jnp.maximum(epdot_eq, 1e-6), m)
+    aniso = (2.0 + r_value) / 3.0
+    temp_fac = 1.0 - alpha * jnp.maximum(T - Tref, 0.0)
+    return sigma0 * temp_fac * jnp.power(1.0 + ep_eq, n) * rate_fac / aniso
+
+@jit
+def step_cv_jax(cv, T, rho_d, dt):
+    """空孔濃度の時間発展"""
+    kB_eV = 8.617e-5
+    c0 = 1e-6; Ev_eV = 1.0; tau0 = 1e-3; Q_eV = 0.8
+    k_ann = 1e6; k_sink = 1e-15
+    
+    cv_eq = c0 * jnp.exp(-Ev_eV / (kB_eV * T))
+    tau = tau0 * jnp.exp(Q_eV / (kB_eV * T))
+    dcv = (cv_eq - cv) / tau - k_ann * cv**2 - k_sink * cv * rho_d
+    return cv + dcv * dt
+
+@jit
+def step_rho_jax(rho_d, epdot_eq, T, dt):
+    """転位密度の時間発展"""
+    A = 1e14; B = 1e-4; Qv_eV = 0.8; kB_eV = 8.617e-5
+    Dv = 1e-6 * jnp.exp(-Qv_eV / (kB_eV * T))
+    drho = A * jnp.maximum(epdot_eq, 0.0) - B * rho_d * Dv
+    return jnp.maximum(rho_d + drho * dt, 1e10)
+
+@jit
+def get_k_scale_smooth_jax(beta, params):
+    """滑らかなK_scale選択（分岐レス）"""
+    w_draw = jnp.exp(-((beta + 0.5) / 0.1)**2)
+    w_plane = jnp.exp(-(beta / 0.1)**2)
+    w_biax = jnp.exp(-((beta - 0.5) / 0.2)**2)
+    w_else = 1.0 - jnp.maximum(w_draw, jnp.maximum(w_plane, w_biax))
+    
+    w_sum = w_draw + w_plane + w_biax + w_else + 1e-8
+    
+    return (params["K_scale_draw"] * w_draw + 
+            params["K_scale_plane"] * w_plane +
+            params["K_scale_biax"] * w_biax +
+            params["K_scale"] * w_else) / w_sum
+
+@jit
+def beta_multiplier_jax(beta, A, bw):
+    """β依存ゲイン（V字形状）"""
+    b = jnp.clip(beta, -0.95, 0.95)
+    return 1.0 + A * jnp.exp(-(b / bw)**2)
+
+@jit
+def beta_multiplier_asymmetric_jax(beta, A_neg, A_pos, bw):
+    """非対称β依存ゲイン"""
+    b = jnp.clip(beta, -0.95, 0.95)
+    A = jnp.where(b < 0, A_neg, A_pos)
+    return 1.0 + A * jnp.exp(-(b / bw)**2)
+
+@jit
+def mu_effective_jax(mu0, T, pN, vslip):
+    """温度・速度・荷重依存の有効摩擦係数（Stribeck風）"""
+    s = (vslip * 1e3) / (pN / 1e6 + 1.0)
+    stribeck = 0.7 + 0.3 / (1 + s)
+    temp_reduction = 1.0 - 1e-4 * jnp.maximum(T - 293.15, 0)
+    return mu0 * stribeck * temp_reduction
+
+def smooth_signal_jax(x, window_size=11):
+    """JAX版移動平均によるスムージング（スパイク除去）"""
+    if window_size <= 1 or len(x) <= window_size:
+        return x
+    kernel = jnp.ones(window_size) / window_size
+    padded = jnp.pad(x, (window_size//2, window_size//2), mode='edge')
+    smoothed = jnp.convolve(padded, kernel, mode='valid')
+    return smoothed[:len(x)]
+
+# =============================================================================
+# Section 4: メインシミュレーションエンジン
+# =============================================================================
+
+@jit
+def simulate_lambda_jax(schedule_dict, mat_dict, edr_dict):
+    """
+    JAX版EDRシミュレーション
+    
+    Args:
+        schedule_dict: 時系列データ（JAX dict）
+        mat_dict: 材料パラメータ（JAX dict）
+        edr_dict: EDRパラメータ（JAX dict）
+    
+    Returns:
+        dict: {"Lambda": Λ(t), "Damage": D(t)}
+    """
+    # データ取り出し
+    t = schedule_dict['t']
+    epsM = schedule_dict['eps_maj']
+    epsm = schedule_dict['eps_min']
+    triax = schedule_dict['triax']
+    mu = schedule_dict['mu']
+    pN = schedule_dict['pN']
+    vslip = schedule_dict['vslip']
+    htc = schedule_dict['htc']
+    Tdie = schedule_dict['Tdie']
+    contact = schedule_dict['contact']
+    T0 = schedule_dict['T0']
+    
+    dt = (t[-1] - t[0]) / (len(t) - 1)
+    
+    # ひずみ速度計算
+    epsM_dot = jnp.gradient(epsM, dt)
+    epsm_dot = jnp.gradient(epsm, dt)
+    
+    # 経路平均β
+    beta_avg = jnp.mean(epsm / (epsM + 1e-10))
+    
+    # scanで時間ループ
+    def time_step(carry, inputs):
+        T, cv, rho_d, ep_eq, h_eff, eps3, beta_hist = carry
+        idx = inputs
+        
+        epsM_dot_t = epsM_dot[idx]
+        epsm_dot_t = epsm_dot[idx]
+        triax_t = triax[idx]
+        mu_t = mu[idx]
+        pN_t = pN[idx]
+        vslip_t = vslip[idx]
+        htc_t = htc[idx]
+        Tdie_t = Tdie[idx]
+        contact_t = contact[idx]
+        
+        # 相当ひずみ速度
+        epdot_eq = equiv_strain_rate_jax(epsM_dot_t, epsm_dot_t)
+        
+        # 板厚更新
+        d_eps3 = -(epsM_dot_t + epsm_dot_t) * dt
+        eps3_new = eps3 + d_eps3
+        h_eff_new = jnp.maximum(mat_dict['h0'] * jnp.exp(eps3_new), 0.2 * mat_dict['h0'])
+        
+        # 熱収支
+        q_fric = mu_t * pN_t * vslip_t * contact_t
+        dTdt = (2.0 * htc_t * (Tdie_t - T) + 2.0 * edr_dict['chi'] * q_fric) / \
+               (mat_dict['rho'] * mat_dict['cp'] * h_eff_new)
+        dTdt = jnp.clip(dTdt, -1000.0, 1000.0)
+        T_new = jnp.clip(T + dTdt * dt, 200.0, 2000.0)
+        
+        # 欠陥更新
+        rho_d_new = step_rho_jax(rho_d, epdot_eq, T, dt)
+        cv_new = step_cv_jax(cv, T, rho_d_new, dt)
+        
+        # K計算
+        K_th = mat_dict['rho'] * mat_dict['cp'] * jnp.maximum(dTdt, 0.0)
+        
+        sigma_eq = flow_stress_jax(ep_eq, epdot_eq, mat_dict['sigma0'], 
+                                   mat_dict['n'], mat_dict['m'], mat_dict['r_value'], T)
+        K_pl = 0.9 * sigma_eq * epdot_eq
+        
+        mu_eff = mu_effective_jax(mu_t, T, pN_t, vslip_t)
+        q_fric_eff = mu_eff * pN_t * vslip_t * contact_t
+        K_fr = (2.0 * edr_dict['chi'] * q_fric_eff) / h_eff_new
+        
+        # K_scale選択
+        k_scale_path = get_k_scale_smooth_jax(beta_avg, edr_dict)
+        
+        # β瞬間値とβ履歴の5点移動平均
+        beta_inst = epsm_dot_t / (epsM_dot_t + 1e-8)
+        beta_hist_new = jnp.roll(beta_hist, -1).at[4].set(beta_inst)
+        beta_smooth = jnp.mean(beta_hist_new)
+        
+        # K_total（非対称ゲイン使用）
+        K_total = k_scale_path * (K_th + K_pl + K_fr)
+        K_total *= beta_multiplier_asymmetric_jax(
+            beta_smooth, 
+            edr_dict['beta_A'], 
+            edr_dict.get('beta_A_pos', edr_dict['beta_A']),
+            edr_dict['beta_bw']
+        )
+        K_total = jnp.maximum(K_total, 0.0)
+        K_total = jnp.where(jnp.isnan(K_total), 0.0, K_total)
+        
+        # V_eff（温度依存性）
+        T_ratio = jnp.minimum((T - 273.15) / (1500.0 - 273.15), 1.0)
+        temp_factor = 1.0 - 0.5 * T_ratio
+        V_eff = edr_dict['V0'] * temp_factor * \
+                (1.0 - edr_dict['av'] * cv - edr_dict['ad'] * jnp.sqrt(jnp.maximum(rho_d, 1e10)))
+        V_eff = jnp.maximum(V_eff, 0.01 * edr_dict['V0'])
+        V_eff = jnp.where(jnp.isnan(V_eff), edr_dict['V0'], V_eff)
+        
+        # 三軸度補正
+        D_triax = jnp.exp(-edr_dict['triax_sens'] * jnp.maximum(triax_t, 0.0))
+        D_triax = jnp.where(jnp.isnan(D_triax), 1.0, D_triax)
+        
+        # Λ計算
+        Lambda = K_total / jnp.maximum(V_eff * D_triax, 1e7)
+        Lambda = jnp.minimum(Lambda, 10.0)
+        Lambda = jnp.where(jnp.isnan(Lambda), 0.0, Lambda)
+        
+        # 相当塑性ひずみ更新
+        ep_eq_new = ep_eq + epdot_eq * dt
+        
+        new_carry = (T_new, cv_new, rho_d_new, ep_eq_new, h_eff_new, eps3_new, beta_hist_new)
+        return new_carry, Lambda
+    
+    # 初期状態
+    init_beta_hist = jnp.zeros(5)
+    init_carry = (T0, 1e-7, 1e11, 0.0, mat_dict['h0'], 0.0, init_beta_hist)
+    
+    # scan実行
+    indices = jnp.arange(len(t) - 1)
+    _, Lambdas = jax.lax.scan(time_step, init_carry, indices)
+    
+    # Damage積分
+    Damage = jnp.cumsum(jnp.maximum(Lambdas - edr_dict['Lambda_crit'], 0.0) * dt)
+    
+    return {"Lambda": Lambdas, "Damage": Damage}
+
+# =============================================================================
+# Section 5: パラメータ管理
+# =============================================================================
+
+def init_edr_params_jax():
+    """JAX用パラメータ初期化"""
+    return {
+        'log_V0': jnp.log(1.5e9),
+        'log_av': jnp.log(4e4),
+        'log_ad': jnp.log(1e-7),
+        'logit_chi': jnp.log(0.09 / (1 - 0.09)),
+        'logit_K_scale': jnp.log(0.25 / (1 - 0.25)),
+        'logit_K_scale_draw': jnp.log(0.18 / (1 - 0.18)),
+        'logit_K_scale_plane': jnp.log(0.25 / (1 - 0.25)),
+        'logit_K_scale_biax': jnp.log(0.22 / (1 - 0.22)),
+        'logit_triax_sens': jnp.log(0.28 / (1 - 0.28)),
+        'Lambda_crit': jnp.array(0.97),
+        'logit_beta_A': jnp.log(0.32 / (1 - 0.32)),
+        'logit_beta_bw': jnp.log(0.29 / (1 - 0.29)),
+        'logit_beta_A_pos': jnp.log(0.48 / (1 - 0.48)),
+    }
+
+def transform_params_jax(raw_params):
+    """制約付きパラメータ変換（soft bounds）"""
+    return {
+        'V0': jnp.exp(raw_params['log_V0']),
+        'av': jnp.exp(raw_params['log_av']),
+        'ad': jnp.exp(raw_params['log_ad']),
+        'chi': soft_clamp(raw_params['logit_chi'], 0.05, 0.3),
+        'K_scale': soft_clamp(raw_params['logit_K_scale'], 0.05, 1.0),
+        'K_scale_draw': soft_clamp(raw_params['logit_K_scale_draw'], 0.05, 0.3),
+        'K_scale_plane': soft_clamp(raw_params['logit_K_scale_plane'], 0.1, 0.4),
+        'K_scale_biax': soft_clamp(raw_params['logit_K_scale_biax'], 0.05, 0.3),
+        'triax_sens': soft_clamp(raw_params['logit_triax_sens'], 0.1, 0.5),
+        'Lambda_crit': jnp.clip(raw_params['Lambda_crit'], 0.95, 1.05),
+        'beta_A': soft_clamp(raw_params['logit_beta_A'], 0.2, 0.5),
+        'beta_bw': soft_clamp(raw_params['logit_beta_bw'], 0.2, 0.35),
+        'beta_A_pos': soft_clamp(raw_params['logit_beta_A_pos'], 0.3, 0.7),
+    }
+
+def edr_dict_to_dataclass(edr_dict):
+    """dict → EDRParams変換"""
+    return EDRParams(
+        V0=float(jax.device_get(edr_dict['V0'])),
+        av=float(jax.device_get(edr_dict['av'])),
+        ad=float(jax.device_get(edr_dict['ad'])),
+        chi=float(jax.device_get(edr_dict['chi'])),
+        K_scale=float(jax.device_get(edr_dict['K_scale'])),
+        triax_sens=float(jax.device_get(edr_dict['triax_sens'])),
+        Lambda_crit=float(jax.device_get(edr_dict['Lambda_crit'])),
+        K_scale_draw=float(jax.device_get(edr_dict['K_scale_draw'])),
+        K_scale_plane=float(jax.device_get(edr_dict['K_scale_plane'])),
+        K_scale_biax=float(jax.device_get(edr_dict['K_scale_biax'])),
+        beta_A=float(jax.device_get(edr_dict['beta_A'])),
+        beta_bw=float(jax.device_get(edr_dict['beta_bw'])),
+        beta_A_pos=float(jax.device_get(edr_dict.get('beta_A_pos', edr_dict['beta_A']))),
+    )
+
+# =============================================================================
+# Section 6: 基本ヘルパー関数
+# =============================================================================
+
+def predict_FLC_point(path_ratio: float, major_rate: float, duration_max: float,
+                     mat: MaterialParams, edr: EDRParams,
+                     base_contact: float=1.0, base_mu: float=0.08,
+                     base_pN: float=200e6, base_vslip: float=0.02,
+                     base_htc: float=8000.0, Tdie: float=293.15,
+                     T0: float=293.15) -> Tuple[float, float]:
+    """FLC限界点予測"""
+    dt = 1e-3
+    N = int(duration_max/dt) + 1
+    t = np.linspace(0, duration_max, N)
+    epsM = major_rate * t
+    epsm = path_ratio * major_rate * t
+    
+    schedule = PressSchedule(
+        t=t, eps_maj=epsM, eps_min=epsm,
+        triax=np.full(N, float(triax_from_path_jax(path_ratio))),
+        mu=np.full(N, base_mu), pN=np.full(N, base_pN),
+        vslip=np.full(N, base_vslip), htc=np.full(N, base_htc),
+        Tdie=np.full(N, Tdie), contact=np.full(N, base_contact), T0=T0
+    )
+    
+    # JAX版で実行
+    schedule_dict = schedule_to_jax_dict(schedule)
+    mat_dict = mat_to_jax_dict(mat)
+    edr_dict = {
+        'V0': edr.V0, 'av': edr.av, 'ad': edr.ad, 'chi': edr.chi,
+        'K_scale': edr.K_scale, 'triax_sens': edr.triax_sens,
+        'Lambda_crit': edr.Lambda_crit,
+        'K_scale_draw': edr.K_scale_draw,
+        'K_scale_plane': edr.K_scale_plane,
+        'K_scale_biax': edr.K_scale_biax,
+        'beta_A': edr.beta_A, 'beta_bw': edr.beta_bw,
+        'beta_A_pos': edr.beta_A_pos
+    }
+    
+    res = simulate_lambda_jax(schedule_dict, mat_dict, edr_dict)
+    Lambda = np.array(res["Lambda"])
+    
+    # スムージング
+    Lambda_smooth = np.array(smooth_signal_jax(jnp.array(Lambda), window_size=11))
+    
+    # 限界点を探す
+    idx = np.where(Lambda_smooth > edr.Lambda_crit)[0]
+    if len(idx) > 0:
+        k = idx[0]
+        return float(epsM[k]), float(epsm[k])
+    else:
+        return float(epsM[-1]), float(epsm[-1])
+
+# =============================================================================
+# エクスポート
+# =============================================================================
+
+__all__ = [
+    # データ構造
+    'MaterialParams',
+    'EDRParams',
+    'PressSchedule',
+    'ExpBinary',
+    'FLCPoint',
+    
+    # 変換関数
+    'schedule_to_jax_dict',
+    'mat_to_jax_dict',
+    
+    # 物理計算ヘルパー
+    'soft_clamp',
+    'triax_from_path_jax',
+    'equiv_strain_rate_jax',
+    'flow_stress_jax',
+    'smooth_signal_jax',
+    
+    # メインシミュレーション
+    'simulate_lambda_jax',
+    
+    # パラメータ管理
+    'init_edr_params_jax',
+    'transform_params_jax',
+    'edr_dict_to_dataclass',
+    
+    # 基本ヘルパー
+    'predict_FLC_point',
+]
