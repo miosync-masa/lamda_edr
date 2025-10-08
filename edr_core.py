@@ -481,6 +481,56 @@ def predict_FLC_point(path_ratio: float, major_rate: float, duration_max: float,
         return float(epsM[-1]), float(epsm[-1])
 
 # =============================================================================
+# Section 7: デモデータ生成
+# =============================================================================
+
+def generate_demo_experiments() -> List[ExpBinary]:
+    """デモ実験データ生成"""
+    def mk_schedule(beta, mu_base, mu_jump=False, high_stress=False):
+        dt = 1e-3
+        T = 0.6
+        t = np.arange(0, T+dt, dt)
+        
+        if high_stress:
+            epsM = 0.5 * (t/T)**0.8
+        else:
+            epsM = 0.35 * (t/T)
+        epsm = beta * epsM
+        
+        mu = np.full_like(t, mu_base)
+        if mu_jump:
+            j = int(0.25/dt)
+            mu[j:] += 0.06
+        
+        triax_val = float(triax_from_path_jax(beta))
+        
+        return PressSchedule(
+            t=t, eps_maj=epsM, eps_min=epsm,
+            triax=np.full_like(t, triax_val), mu=mu,
+            pN=np.full_like(t, 250e6 if high_stress else 200e6),
+            vslip=np.full_like(t, 0.03), htc=np.full_like(t, 8000.0),
+            Tdie=np.full_like(t, 293.15), contact=np.full_like(t, 1.0), T0=293.15
+        )
+    
+    exps = [
+        ExpBinary(mk_schedule(-0.5, 0.08, False, False), failed=0, label="safe_draw"),
+        ExpBinary(mk_schedule(-0.5, 0.08, True, True), failed=1, label="draw_fail"),
+        ExpBinary(mk_schedule(0.0, 0.08, False, False), failed=0, label="safe_plane"),
+        ExpBinary(mk_schedule(0.0, 0.08, True, True), failed=1, label="plane_fail"),
+        ExpBinary(mk_schedule(0.5, 0.10, False, False), failed=0, label="safe_biax"),
+        ExpBinary(mk_schedule(0.5, 0.10, True, True), failed=1, label="biax_fail"),
+    ]
+    return exps
+
+def generate_demo_flc() -> List[FLCPoint]:
+    """デモFLCデータ生成"""
+    return [
+        FLCPoint(-0.5, 0.35, -0.175, 0.6, 1.0, "draw"),
+        FLCPoint(0.0, 0.28, 0.0, 0.6, 1.0, "plane"),
+        FLCPoint(0.5, 0.22, 0.11, 0.6, 1.0, "biax"),
+    ]
+
+# =============================================================================
 # エクスポート
 # =============================================================================
 
@@ -505,6 +555,10 @@ __all__ = [
     
     # メインシミュレーション
     'simulate_lambda_jax',
+
+    # デモデータ作成
+    'generate_demo_experiments',
+    'generate_demo_flc',
     
     # パラメータ管理
     'init_edr_params_jax',
