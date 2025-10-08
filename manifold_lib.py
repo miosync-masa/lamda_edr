@@ -439,7 +439,6 @@ class ManifoldAnalyzer:
         else:
             self.weights = regularization_weights
     
-    @jit
     def compute_safety_score(self, 
                             Lambda: jnp.ndarray,
                             safe_manifold: SafeManifold) -> jnp.ndarray:
@@ -475,7 +474,6 @@ class ManifoldAnalyzer:
         
         return score
     
-    @jit
     def compute_danger_proximity(self,
                                 Lambda: jnp.ndarray,
                                 danger_manifold: DangerManifold) -> jnp.ndarray:
