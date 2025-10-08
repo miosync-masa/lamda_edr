@@ -453,7 +453,9 @@ def beta_multiplier(beta, A=0.35, bw=0.28):
 
 # ============================
 # メインクラス
+# 最適化済みEDRパラメータ（marie_fitting.pyの結果を利用）
 # ============================
+
 class PressFormingEDR_Advanced:
     """
     プレス成形EDR統合版
@@ -461,17 +463,37 @@ class PressFormingEDR_Advanced:
     - smooth gateによる連続遷移
     - Ms温度のΛ依存性
     """
-
+    
+    # 最適化済みEDRパラメータ（marie_fitting.pyの結果）
+    OPTIMIZED_PARAMS = {
+        'V0': 1804509696.0,
+        'av': 40129.2265625,
+        'ad': 1.0139032724509889e-07,
+        'chi': 0.06883592158555984,
+        'triax_sens': 0.19608554244041443,
+        'Lambda_crit': 1.0499999523162842,
+        'K_scale': 0.2456221878528595,
+        'K_scale_draw': 0.10114696621894836,
+        'K_scale_plane': 0.17811155319213867,
+        'K_scale_biax': 0.10500562191009521,
+        'beta_A': 0.31616225838661194,
+        'beta_bw': 0.23645076155662537,
+        'beta_A_pos': 0.437089741230011,
+    }
+    
     def __init__(self,
+                 use_optimized_params=True,  # カンマ追加
                  thickness=0.001,      # 1mm
                  Nz=11,               # 厚さ方向メッシュ
                  dt=1e-4,             # 時間刻み
                  t_end=0.5,           # 成形時間
-                 # 材料パラメータ
+                 # 材料パラメータ（デフォルト値）
                  V0=2e9,              # 基準凝集エネルギー [J/m³]
                  av=1e5,              # 空孔感度
                  ad=1e-7,             # 転位感度
                  triax_sens=0.3,      # 三軸度感度
+                 Lambda_crit=1.0,     # 追加：臨界Lambda
+                 chi=0.1,             # 追加：摩擦発熱分配
                  # 熱物性
                  rho=7850,            # 密度 [kg/m³]
                  cp=460,              # 比熱 [J/kg·K]
@@ -481,13 +503,21 @@ class PressFormingEDR_Advanced:
                  n_hard=0.2,          # 加工硬化指数
                  m_rate=0.02,         # ひずみ速度感度
                  beta_TQ=0.9,         # Taylor-Quinney係数
-                 # 相変態パラメータ（新規）
+                 # 相変態パラメータ
                  Ms0=550,             # 初期Ms温度 [K]
                  Ms_sens=50.0,        # Ms温度のΛ感度
                  L0=0.8,              # Λ基準値
-                 # シナリオタイプ（新規）
+                 # β関連パラメータ（追加）
+                 beta_A=0.35,
+                 beta_bw=0.28,
+                 beta_A_pos=0.35,
+                 K_scale=1.0,
+                 K_scale_draw=1.0,
+                 K_scale_plane=1.0,
+                 K_scale_biax=1.0,
+                 # シナリオタイプ
                  scenario_type="normal_press"):  # "normal_press" or "hot_stamping"
-
+        
         self.h = thickness
         self.Nz = Nz
         self.z = np.linspace(0, self.h, Nz)
@@ -495,12 +525,42 @@ class PressFormingEDR_Advanced:
         self.dt = dt
         self.t = np.arange(0, t_end + dt, dt)
         self.Nt = len(self.t)
-
-        # 材料定数
-        self.V0 = V0
-        self.av = av
-        self.ad = ad
-        self.triax_sens = triax_sens
+        
+        # 材料定数（最適化パラメータを使う場合は上書き）
+        if use_optimized_params:
+            # marie_fitting.pyの結果を使用
+            self.V0 = self.OPTIMIZED_PARAMS['V0']
+            self.av = self.OPTIMIZED_PARAMS['av']
+            self.ad = self.OPTIMIZED_PARAMS['ad']
+            self.triax_sens = self.OPTIMIZED_PARAMS['triax_sens']
+            self.Lambda_crit = self.OPTIMIZED_PARAMS['Lambda_crit']
+            self.chi = self.OPTIMIZED_PARAMS['chi']
+            # β関連
+            self.beta_A = self.OPTIMIZED_PARAMS['beta_A']
+            self.beta_bw = self.OPTIMIZED_PARAMS['beta_bw']
+            self.beta_A_pos = self.OPTIMIZED_PARAMS['beta_A_pos']
+            # K_scale関連
+            self.K_scale = self.OPTIMIZED_PARAMS['K_scale']
+            self.K_scale_draw = self.OPTIMIZED_PARAMS['K_scale_draw']
+            self.K_scale_plane = self.OPTIMIZED_PARAMS['K_scale_plane']
+            self.K_scale_biax = self.OPTIMIZED_PARAMS['K_scale_biax']
+        else:
+            # デフォルト値を使用
+            self.V0 = V0
+            self.av = av
+            self.ad = ad
+            self.triax_sens = triax_sens
+            self.Lambda_crit = Lambda_crit
+            self.chi = chi
+            self.beta_A = beta_A
+            self.beta_bw = beta_bw
+            self.beta_A_pos = beta_A_pos
+            self.K_scale = K_scale
+            self.K_scale_draw = K_scale_draw
+            self.K_scale_plane = K_scale_plane
+            self.K_scale_biax = K_scale_biax
+        
+        # その他のパラメータ（最適化対象外）
         self.rho = rho
         self.cp = cp
         self.k_thermal = k_thermal
@@ -508,20 +568,20 @@ class PressFormingEDR_Advanced:
         self.n_hard = n_hard
         self.m_rate = m_rate
         self.beta = beta_TQ
-
+        
         # 相変態パラメータ
         self.Ms0 = Ms0
         self.Ms_sens = Ms_sens
         self.L0 = L0
-
+        
         # シナリオタイプ
         self.scenario_type = scenario_type
-
+        
         # 状態変数（初期化）
         self.T_field = np.ones((self.Nt, self.Nz)) * 293.15  # 温度場 [K]
         self.cv_field = np.ones(self.Nz) * 1e-8         # 空孔濃度
         self.rhod_field = np.ones(self.Nz) * 1e10       # 転位密度
-
+        
         # 相分率（5相: [F, P, B, M, A]）
         self.phase_fractions = np.zeros((self.Nt-1, self.Nz, 5))
         if scenario_type == "normal_press":
@@ -531,12 +591,12 @@ class PressFormingEDR_Advanced:
         elif scenario_type == "hot_stamping":
             # ホットスタンピング：初期オーステナイト化（初期時刻のみ）
             self.phase_fractions[0, :, 4] = 1.0  # 100%オーステナイト！
-
+        
         # スカラー状態
         self.ep_eq = 0.0
         self.ep_maj_total = 0.0
         self.ep_min_total = 0.0
-
+        
         # 結果格納用
         self.Lambda = np.zeros((self.Nt-1, self.Nz))
         self.K_components = {
