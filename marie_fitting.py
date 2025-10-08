@@ -287,27 +287,15 @@ def dual_manifold_classification(
     danger_manifold: Optional[DangerManifold] = None,
     weights: Optional[Dict[str, float]] = None
 ) -> Dict:
-    """
-    安全/危険多様体の両方からの相対距離で判定
-    
-    Returns:
-        dict: {
-            'safe_distance': 安全多様体への距離,
-            'danger_distance': 危険多様体への距離（あれば）,
-            'relative_score': 相対スコア（0=安全、1=危険）,
-            'prediction': 0 or 1,
-            'confidence': 確信度
-        }
-    """
     Lambda_smooth = smooth_signal_jax(Lambda, window_size=11)
     G_test = compute_gram(Lambda_smooth)
     
-    # 安全多様体への距離を計算 ← 追加！
+    # float変換を削除！JAX配列のまま
     safe_distances = batch_gram_distance(G_test, safe_manifold.grams)
-    safe_dist = float(jax.device_get(jnp.min(safe_distances)))
+    safe_dist = jnp.min(safe_distances)  # ← floatなし！
     
     result = {
-        'safe_distance': safe_dist,
+        'safe_distance': safe_dist,  # JAX配列のまま
         'danger_distance': None,
         'relative_score': None,
         'prediction': None,
@@ -315,24 +303,19 @@ def dual_manifold_classification(
     }
     
     if danger_manifold is not None:
-        # 危険多様体への距離を計算
         danger_distances = batch_gram_distance(G_test, danger_manifold.grams)
-        danger_dist = float(jax.device_get(jnp.min(danger_distances)))
+        danger_dist = jnp.min(danger_distances)  # ← floatなし！
         result['danger_distance'] = danger_dist
         
-        # 相対スコア（0に近い=安全、1に近い=危険）
+        # 相対スコア（JAX配列のまま）
         relative_score = safe_dist / (safe_dist + danger_dist + 1e-8)
         result['relative_score'] = relative_score
         
-        # 判定（0.5を境界）
-        result['prediction'] = 1 if relative_score > 0.5 else 0
+        # 判定（JAX配列で）
+        result['prediction'] = jnp.where(relative_score > 0.5, 1, 0)
         
-        # 確信度（0.5からの距離）
-        result['confidence'] = abs(relative_score - 0.5) * 2
-    else:
-        # 安全多様体のみの場合は距離ベース
-        # 統計的な閾値が必要（別途計算）
-        pass
+        # 確信度（JAX配列で）
+        result['confidence'] = jnp.abs(relative_score - 0.5) * 2
     
     return result
 
@@ -675,16 +658,17 @@ def evaluate_binary_classification(
         )
         
         if danger_manifold is not None:
-            pred = classification['prediction']
-            conf = classification['confidence']
+            # JAX配列から値を取得
+            pred = int(jax.device_get(classification['prediction']))  # ← 修正！
+            conf = float(jax.device_get(classification['confidence']))  # ← 修正！
             
             if verbose:
                 print(f"\nExp{i} ({exp.label}):")
                 print(f"  真値: {'破断' if exp.failed == 1 else '安全'}")
                 print(f"  予測: {'破断' if pred == 1 else '安全'}")
-                print(f"  安全距離: {classification['safe_distance']:.4f}")
-                print(f"  危険距離: {classification['danger_distance']:.4f}")
-                print(f"  相対スコア: {classification['relative_score']:.4f}")
+                print(f"  安全距離: {float(jax.device_get(classification['safe_distance'])):.4f}")
+                print(f"  危険距離: {float(jax.device_get(classification['danger_distance'])):.4f}")
+                print(f"  相対スコア: {float(jax.device_get(classification['relative_score'])):.4f}")  # ← 修正！
                 print(f"  確信度: {conf:.2%}")
             
             if pred == exp.failed:
@@ -714,7 +698,7 @@ def evaluate_binary_classification(
         'total': len(exps),
         'results': results
     }
-
+    
 # =============================================================================
 # Section 8: 結果の保存と可視化
 # =============================================================================
