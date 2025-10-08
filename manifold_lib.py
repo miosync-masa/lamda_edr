@@ -324,6 +324,7 @@ class SafeManifoldBuilder(ManifoldBuilder):
             grams=jnp.array(safe_grams),
             conditions=safe_conditions,
             n_trajectories=safe_count,
+            manifold_type='safe',
             safety_threshold=safety_threshold,
             metadata={'total_generated': count}
         )
@@ -411,6 +412,7 @@ class DangerManifoldBuilder(ManifoldBuilder):
             grams=jnp.array(danger_grams),
             conditions=danger_conditions,
             n_trajectories=danger_count,
+            manifold_type='danger',
             danger_threshold=danger_threshold,
             metadata={'total_generated': count}
         )
