@@ -302,9 +302,9 @@ def dual_manifold_classification(
     Lambda_smooth = smooth_signal_jax(Lambda, window_size=11)
     G_test = compute_gram(Lambda_smooth)
     
-    # 安全多様体への距離
+    # 安全多様体への距離を計算 ← 追加！
+    safe_distances = batch_gram_distance(G_test, safe_manifold.grams)
     safe_dist = float(jax.device_get(jnp.min(safe_distances)))
-    danger_dist = float(jax.device_get(jnp.min(danger_distances)))
     
     result = {
         'safe_distance': safe_dist,
@@ -315,9 +315,9 @@ def dual_manifold_classification(
     }
     
     if danger_manifold is not None:
-        # 危険多様体への距離
+        # 危険多様体への距離を計算
         danger_distances = batch_gram_distance(G_test, danger_manifold.grams)
-        danger_dist = float(jnp.min(danger_distances))
+        danger_dist = float(jax.device_get(jnp.min(danger_distances)))
         result['danger_distance'] = danger_dist
         
         # 相対スコア（0に近い=安全、1に近い=危険）
