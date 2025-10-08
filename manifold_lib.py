@@ -452,7 +452,7 @@ class ManifoldAnalyzer:
         Returns:
             score: 安全スコア
         """
-        from edr_fit import smooth_signal_jax
+        from edr_core import triax_from_path_jax, smooth_signal_jax
         
         # スムージング
         Lambda_smooth = smooth_signal_jax(Lambda, window_size=11)
@@ -487,7 +487,7 @@ class ManifoldAnalyzer:
         Returns:
             proximity: 危険近接度
         """
-        from edr_fit import smooth_signal_jax
+        from edr_core import triax_from_path_jax, smooth_signal_jax
         
         Lambda_smooth = smooth_signal_jax(Lambda, window_size=11)
         G_test = compute_gram(Lambda_smooth)
@@ -512,7 +512,7 @@ class ManifoldAnalyzer:
         Returns:
             analysis: 分析結果
         """
-        from edr_fit import smooth_signal_jax
+        from edr_core import triax_from_path_jax, smooth_signal_jax
         
         Lambda_smooth = smooth_signal_jax(Lambda, window_size=11)
         
