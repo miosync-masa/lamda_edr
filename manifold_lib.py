@@ -203,7 +203,7 @@ class ManifoldBuilder(ABC):
             Lambda_smooth: スムージング済みΛ(t)
             condition: 生成条件
         """
-        from edr_fit import triax_from_path_jax, smooth_signal_jax
+        from edr_core import triax_from_path_jax, smooth_signal_jax
         
         dt = 1e-3
         N = int(duration/dt) + 1
