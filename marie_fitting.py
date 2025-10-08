@@ -236,7 +236,7 @@ def calculate_dynamic_thresholds(
         res = simulate_lambda_jax(schedule_dict, mat_dict, edr_dict)
         Lambda = res["Lambda"]
         
-        score = float(analyzer.compute_safety_score(Lambda, safe_manifold))
+        score = float(jax.device_get(analyzer.compute_safety_score(Lambda, safe_manifold)))
         
         if exp.failed == 0:
             safe_scores.append(score)
@@ -303,8 +303,8 @@ def dual_manifold_classification(
     G_test = compute_gram(Lambda_smooth)
     
     # 安全多様体への距離
-    safe_distances = batch_gram_distance(G_test, safe_manifold.grams)
-    safe_dist = float(jnp.min(safe_distances))
+    safe_dist = float(jax.device_get(jnp.min(safe_distances)))
+    danger_dist = float(jax.device_get(jnp.min(danger_distances)))
     
     result = {
         'safe_distance': safe_dist,
@@ -528,12 +528,12 @@ def phase0_unsupervised_learning(
         params_phase0 = optax.apply_updates(params_phase0, updates)
         
         if step % 100 == 0:
-            loss = float(loss_phase0(params_phase0))
+            loss = float(jax.device_get(loss_phase0(params_phase0)))
             loss_history.append(loss)
             if verbose:
                 print(f"  Step {step:3d}: Physics Loss = {loss:.6f}")
     
-    final_loss = float(loss_phase0(params_phase0))
+    final_loss = float(jax.device_get(loss_phase0(params_phase0)))
     loss_history.append(final_loss)
     
     if verbose:
@@ -821,8 +821,8 @@ def plot_flc_fitting_results(
     
     for beta in beta_range:
         Em, em, _ = predict_flc_from_sim_jax(beta, mat_dict, edr_dict)
-        Em_pred.append(float(Em))
-        em_pred.append(float(em))
+        Em_pred.append(float(jax.device_get(Em)))
+        em_pred.append(float(jax.device_get(em)))
     
     # プロット1: ひずみ空間のFLC
     ax1.plot(em_pred, Em_pred, 'b-', linewidth=2, label='Predicted FLC')
