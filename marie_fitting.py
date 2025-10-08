@@ -567,7 +567,9 @@ def phase_15b_manifold_optimization(
     
     # FLC目標値の設定
     if flc_target is None:
-        flc_target = float(loss_flc_true_jax(params_init, flc_pts_data, mat_dict))
+        flc_target = float(jax.device_get(
+            loss_flc_true_jax(params_init, flc_pts_data, mat_dict)
+        ))
     
     if verbose:
         print("\n" + "="*60)
@@ -621,13 +623,19 @@ def phase_15b_manifold_optimization(
         
         if step % 100 == 0 and verbose:
             total_loss, flc_loss, bin_loss = loss_constrained(params)
-            history['total'].append(float(total_loss))
-            history['flc'].append(float(flc_loss))
-            history['binary'].append(float(bin_loss))
             
-            print(f"  Step {step:3d}: Total = {float(total_loss):.6f} "
-                  f"(FLC: {float(flc_loss):.6f}, Binary: {float(bin_loss):.6f})")
-    
+            # JAXトレース値を具体値に変換
+            total_val = float(jax.device_get(total_loss))
+            flc_val = float(jax.device_get(flc_loss))
+            bin_val = float(jax.device_get(bin_loss))
+            
+            history['total'].append(total_val)
+            history['flc'].append(flc_val)
+            history['binary'].append(bin_val)
+            
+            print(f"  Step {step:3d}: Total = {total_val:.6f} "
+                  f"(FLC: {flc_val:.6f}, Binary: {bin_val:.6f})")
+        
     if verbose:
         print(f"\n  ✅ Phase 1.5B完了！")
     
