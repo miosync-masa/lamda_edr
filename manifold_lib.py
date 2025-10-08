@@ -248,9 +248,9 @@ class SafeManifoldBuilder(ManifoldBuilder):
     """安全多様体構築クラス"""
     
     def build(self, 
-              n_beta: int = 15,
-              n_mu: int = 5,
-              n_pN: int = 5,
+              n_beta: int = 25,
+              n_mu: int = 10,
+              n_pN: int = 10,
               duration: float = 0.6,
               safety_margin: float = 0.85,
               verbose: bool = True) -> SafeManifold:
@@ -337,9 +337,9 @@ class DangerManifoldBuilder(ManifoldBuilder):
     """危険多様体構築クラス"""
     
     def build(self,
-              n_beta: int = 15,
-              n_mu: int = 5,
-              n_pN: int = 5,
+              n_beta: int = 25,
+              n_mu: int = 10,
+              n_pN: int = 10,
               duration: float = 0.6,
               danger_margin: float = 1.15,
               verbose: bool = True) -> DangerManifold:
