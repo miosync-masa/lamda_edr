@@ -549,6 +549,87 @@ def phase0_unsupervised_learning(
     return params_phase0, loss_history
 
 # =============================================================================
+# Section 5.5: Phase 1 - 純粋なFLCフィッティング（追加！）
+# =============================================================================
+
+def phase1_flc_optimization(
+    params_init,
+    flc_pts_data: Dict,
+    mat_dict: Dict,
+    n_steps: int = 200,
+    verbose: bool = True
+) -> Tuple[Dict, List[float]]:
+    """
+    Phase 1: FLC専用最適化（バイナリ制約なし）
+    """
+    if verbose:
+        print("\n" + "="*60)
+        print(" 🎯 Phase 1: Pure FLC Fitting")
+        print("="*60)
+        print(f"  データ点数: {len(flc_pts_data['path_ratios'])}")
+        print(f"  最適化ステップ: {n_steps}")
+    
+    # 純粋なFLC損失のみ！
+    def loss_flc_only(params):
+        return loss_flc_true_jax(params, flc_pts_data, mat_dict)
+    
+    # オプティマイザ設定（FLC専用チューニング）
+    schedule = optax.exponential_decay(
+        init_value=2e-3,  # Phase 0より高め
+        transition_steps=40,
+        decay_rate=0.95
+    )
+    
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(0.5),  # やや緩め
+        optax.adam(learning_rate=schedule)
+    )
+    
+    opt_state = optimizer.init(params_init)
+    params = params_init
+    grad_fn = jax.grad(loss_flc_only)
+    
+    loss_history = []
+    best_loss = float('inf')
+    best_params = params_init
+    
+    for step in range(n_steps):
+        grads = grad_fn(params)
+        updates, opt_state = optimizer.update(grads, opt_state, params)
+        params = optax.apply_updates(params, updates)
+        
+        if step % 50 == 0 or step == n_steps - 1:
+            loss = float(jax.device_get(loss_flc_only(params)))
+            loss_history.append(loss)
+            
+            # ベストパラメータを保持
+            if loss < best_loss:
+                best_loss = loss
+                best_params = params
+            
+            if verbose:
+                print(f"  Step {step:3d}: FLC Loss = {loss:.6f}")
+    
+    if verbose:
+        print(f"\n  ✅ Phase 1完了!")
+        print(f"  最良FLC損失: {best_loss:.6f}")
+        
+        # 実際の誤差を計算
+        edr_dict = transform_params_jax(best_params)
+        total_error = 0.0
+        for i in range(len(flc_pts_data['path_ratios'])):
+            beta = flc_pts_data['path_ratios'][i]
+            Em_gt = flc_pts_data['major_limits'][i]
+            Em_pred, _, _ = predict_flc_from_sim_jax(beta, mat_dict, edr_dict)
+            error = abs(float(jax.device_get(Em_pred)) - Em_gt) / Em_gt
+            total_error += error
+        
+        avg_error = total_error / len(flc_pts_data['path_ratios'])
+        print(f"  平均相対誤差: {avg_error*100:.2f}%")
+    
+    return best_params, loss_history
+
+# =============================================================================
 # Section 6: Phase 1.5B - 制約付き多様体最適化
 # =============================================================================
 
