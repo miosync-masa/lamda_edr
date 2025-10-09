@@ -251,7 +251,7 @@ class SafeManifoldBuilder(ManifoldBuilder):
               n_beta: int = 25,
               n_mu: int = 10,
               n_pN: int = 10,
-              duration: float = 0.6,
+              duration: float = 0.5,
               safety_margin: float = 0.85,
               verbose: bool = True) -> SafeManifold:
         """
@@ -340,7 +340,7 @@ class DangerManifoldBuilder(ManifoldBuilder):
               n_beta: int = 25,
               n_mu: int = 10,
               n_pN: int = 10,
-              duration: float = 0.6,
+              duration: float = 0.5,
               danger_margin: float = 1.15,
               verbose: bool = True) -> DangerManifold:
         """
