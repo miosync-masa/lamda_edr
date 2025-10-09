@@ -651,7 +651,6 @@ def phase_15b_manifold_optimization(
 # =============================================================================
 # Section 7: 検証と評価
 # =============================================================================
-
 def evaluate_binary_classification(
     exps: List[ExpBinary],
     mat_dict: Dict,
@@ -676,15 +675,14 @@ def evaluate_binary_classification(
         res = simulate_lambda_jax(schedule_dict, mat_dict, edr_dict)
         Lambda = res["Lambda"]
         
-        # 相対距離判定
-        classification = dual_manifold_classification(
-            Lambda, safe_manifold, danger_manifold
-        )
-        
+        # 判定処理
         if danger_manifold is not None:
-            # JAX配列から値を取得
-            pred = int(jax.device_get(classification['prediction']))  # ← 修正！
-            conf = float(jax.device_get(classification['confidence']))  # ← 修正！
+            # 相対距離判定
+            classification = dual_manifold_classification(
+                Lambda, safe_manifold, danger_manifold
+            )
+            pred = int(jax.device_get(classification['prediction']))
+            conf = float(jax.device_get(classification['confidence']))
             
             if verbose:
                 print(f"\nExp{i} ({exp.label}):")
@@ -692,26 +690,48 @@ def evaluate_binary_classification(
                 print(f"  予測: {'破断' if pred == 1 else '安全'}")
                 print(f"  安全距離: {float(jax.device_get(classification['safe_distance'])):.4f}")
                 print(f"  危険距離: {float(jax.device_get(classification['danger_distance'])):.4f}")
-                print(f"  相対スコア: {float(jax.device_get(classification['relative_score'])):.4f}")  # ← 修正！
+                print(f"  相対スコア: {float(jax.device_get(classification['relative_score'])):.4f}")
                 print(f"  確信度: {conf:.2%}")
+        else:
+            # 安全多様体のみの判定
+            safety_score = compute_safety_score_jax(Lambda, safe_manifold)
+            safety_score_val = float(jax.device_get(safety_score))
             
-            if pred == exp.failed:
-                correct += 1
-                if verbose:
-                    print("  ✓ 正解！")
-            else:
-                if verbose:
-                    print("  ✗ 不正解")
+            # 動的閾値を使用（safe_manifoldの統計から）
+            threshold = safe_manifold.metadata.get('fisher_threshold', 0.5)
+            pred = 1 if safety_score_val > threshold else 0
+            
+            if verbose:
+                print(f"\nExp{i} ({exp.label}):")
+                print(f"  真値: {'破断' if exp.failed == 1 else '安全'}")
+                print(f"  予測: {'破断' if pred == 1 else '安全'}")
+                print(f"  安全スコア: {safety_score_val:.4f}")
+                print(f"  閾値: {threshold:.4f}")
+            
+            classification = {
+                'prediction': pred,
+                'safety_score': safety_score_val,
+                'threshold': threshold
+            }
+        
+        # 正解判定
+        if pred == exp.failed:
+            correct += 1
+            if verbose:
+                print("  ✓ 正解！")
+        else:
+            if verbose:
+                print("  ✗ 不正解")
         
         results.append({
             'exp': exp,
             'classification': classification,
-            'correct': pred == exp.failed if danger_manifold else None
+            'correct': pred == exp.failed
         })
     
-    accuracy = correct / len(exps) * 100 if danger_manifold else None
+    accuracy = correct / len(exps) * 100
     
-    if verbose and accuracy is not None:
+    if verbose:
         print(f"\n{'='*60}")
         print(f"最終精度: {accuracy:.2f}%")
         print(f"正解数: {correct}/{len(exps)}")
