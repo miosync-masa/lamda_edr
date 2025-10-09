@@ -117,8 +117,9 @@ def loss_fn_jax(raw_params, exps, mat):
     
     return total_loss / len(exps)
 
+@jit
 def predict_flc_from_sim_jax(beta, mat_dict, edr_dict, major_rate=0.6, duration=1.0):
-    """Λ(t)シミュレーションからFLC限界点を抽出（β依存スケーリング版）"""
+    """改良版：符号変化検出＋線形補間"""
     dt = 1e-3
     N = int(duration/dt) + 1
     t = jnp.linspace(0, duration, N)
@@ -143,23 +144,32 @@ def predict_flc_from_sim_jax(beta, mat_dict, edr_dict, major_rate=0.6, duration=
     Lambda_smooth = smooth_signal_jax(res["Lambda"], window_size=11)
     
     epsM_trimmed = epsM[:-1]
+    Λcrit = edr_dict['Lambda_crit']
     
-    # β依存でLambda_critを調整（張出し側は閾値を上げる）
-    # β=-0.5で0.95倍、β=0で1.0倍、β=1.0で1.15倍くらい
-    crit_scale = 1.0 + 0.15 * beta
-    Lambda_crit_eff = edr_dict['Lambda_crit'] * jnp.clip(crit_scale, 0.9, 1.2)
+    # 1️⃣ 符号変化検出
+    diff = Lambda_smooth[:-1] - Λcrit
+    sign_change = jnp.maximum(-diff[:-1] * diff[1:], 0.0)
     
-    # シンプルな限界判定
-    exceed_mask = Lambda_smooth > Lambda_crit_eff
-    first_exceed_idx = jnp.argmax(exceed_mask)
-    has_exceeded = jnp.any(exceed_mask)
+    # 2️⃣ スムーズな重み（符号変化点に集中）
+    w = jnp.exp(50.0 * sign_change)
+    w = w / (jnp.sum(w) + 1e-12)
     
-    # 超えた場合はその点、超えない場合は最大Lambda位置
-    Em = jnp.where(
-        has_exceeded,
-        epsM_trimmed[first_exceed_idx],
-        epsM_trimmed[jnp.argmax(Lambda_smooth)]
-    )
+    # 3️⃣ ピーク位置特定と線形補間
+    idx = jnp.argmax(w)
+    idx = jnp.minimum(idx, len(epsM_trimmed)-2)
+    
+    Λ1 = Lambda_smooth[idx]
+    Λ2 = Lambda_smooth[idx+1]
+    e1 = epsM_trimmed[idx]
+    e2 = epsM_trimmed[idx+1]
+    
+    # 線形補間で正確な交点
+    frac = jnp.clip((Λcrit - Λ1) / (Λ2 - Λ1 + 1e-12), 0.0, 1.0)
+    Em = e1 + frac * (e2 - e1)
+    
+    # 安全装置
+    Em = jnp.where(jnp.isnan(Em), epsM_trimmed[-1], Em)
+    Em = jnp.clip(Em, 0.05, 0.8)
     
     em = beta * Em
     return Em, em, Lambda_smooth
