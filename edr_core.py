@@ -374,41 +374,53 @@ def simulate_lambda_jax(schedule_dict, mat_dict, edr_dict):
 # =============================================================================
 
 def init_edr_params_jax():
-    """JAX用パラメータ初期化"""
+    """JAX用パラメータ初期化（改良版）"""
     return {
         'log_V0': jnp.log(1.5e9),
         'log_av': jnp.log(4e4),
         'log_ad': jnp.log(1e-7),
         'logit_chi': jnp.log(0.09 / (1 - 0.09)),
         'logit_K_scale': jnp.log(0.25 / (1 - 0.25)),
-        'logit_K_scale_draw': jnp.log(0.18 / (1 - 0.18)),
-        'logit_K_scale_plane': jnp.log(0.25 / (1 - 0.25)),
-        'logit_K_scale_biax': jnp.log(0.22 / (1 - 0.22)),
-        'logit_triax_sens': jnp.log(0.28 / (1 - 0.28)),
-        'Lambda_crit': jnp.array(0.97),
-        'logit_beta_A': jnp.log(0.32 / (1 - 0.32)),
-        'logit_beta_bw': jnp.log(0.29 / (1 - 0.29)),
-        'logit_beta_A_pos': jnp.log(0.48 / (1 - 0.48)),
+        
+        # K_scale系を調整（深絞りを大きく）
+        'logit_K_scale_draw': jnp.log(0.30 / (1 - 0.30)),  # 0.18→0.30に増加！
+        'logit_K_scale_plane': jnp.log(0.25 / (1 - 0.25)),  # そのまま
+        'logit_K_scale_biax': jnp.log(0.20 / (1 - 0.20)),   # 0.22→0.20に微減
+        
+        'logit_triax_sens': jnp.log(0.25 / (1 - 0.25)),  # 0.28→0.25に微調整
+        
+        # Lambda_critを上げる
+        'Lambda_crit': jnp.array(1.05),  # 0.97→1.05（理論値に近づける）
+        
+        # beta系でV字を深く急峻に
+        'logit_beta_A': jnp.log(0.40 / (1 - 0.40)),     # 0.32→0.40（深く）
+        'logit_beta_bw': jnp.log(0.22 / (1 - 0.22)),    # 0.29→0.22（狭く）
+        'logit_beta_A_pos': jnp.log(0.45 / (1 - 0.45)), # 0.48→0.45（微調整）
     }
 
 def transform_params_jax(raw_params):
-    """制約付きパラメータ変換（soft bounds）"""
+    """制約付きパラメータ変換（改良版）"""
     return {
         'V0': jnp.exp(raw_params['log_V0']),
         'av': jnp.exp(raw_params['log_av']),
         'ad': jnp.exp(raw_params['log_ad']),
         'chi': soft_clamp(raw_params['logit_chi'], 0.05, 0.3),
         'K_scale': soft_clamp(raw_params['logit_K_scale'], 0.05, 1.0),
-        'K_scale_draw': soft_clamp(raw_params['logit_K_scale_draw'], 0.05, 0.3),
-        'K_scale_plane': soft_clamp(raw_params['logit_K_scale_plane'], 0.1, 0.4),
-        'K_scale_biax': soft_clamp(raw_params['logit_K_scale_biax'], 0.05, 0.3),
+        
+        # K_scale系の上限を緩める
+        'K_scale_draw': soft_clamp(raw_params['logit_K_scale_draw'], 0.05, 0.5),  # 0.3→0.5
+        'K_scale_plane': soft_clamp(raw_params['logit_K_scale_plane'], 0.1, 0.4),  # そのまま
+        'K_scale_biax': soft_clamp(raw_params['logit_K_scale_biax'], 0.05, 0.3),  # そのまま
+        
         'triax_sens': soft_clamp(raw_params['logit_triax_sens'], 0.1, 0.5),
-        'Lambda_crit': jnp.clip(raw_params['Lambda_crit'], 0.95, 1.05),
-        'beta_A': soft_clamp(raw_params['logit_beta_A'], 0.2, 0.5),
-        'beta_bw': soft_clamp(raw_params['logit_beta_bw'], 0.2, 0.35),
+        'Lambda_crit': jnp.clip(raw_params['Lambda_crit'], 0.95, 1.10),  # 上限も1.10に
+        
+        # beta系も範囲調整
+        'beta_A': soft_clamp(raw_params['logit_beta_A'], 0.2, 0.6),    # 0.5→0.6
+        'beta_bw': soft_clamp(raw_params['logit_beta_bw'], 0.15, 0.35), # 下限を0.15に
         'beta_A_pos': soft_clamp(raw_params['logit_beta_A_pos'], 0.3, 0.7),
     }
-
+    
 def edr_dict_to_dataclass(edr_dict):
     """dict → EDRParams変換"""
     return EDRParams(
