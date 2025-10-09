@@ -449,7 +449,7 @@ def init_edr_params_jax():
         'log_ad': jnp.log(1e-7),
         'logit_chi': jnp.log(0.09 / (1 - 0.09)),
         'logit_triax_sens': jnp.log(0.25 / (1 - 0.25)),
-        'Lambda_crit': jnp.array(1.05),
+        'Lambda_crit': jnp.array(0.95),
     }
     
     # β基底のRBFパラメータ（K=4基底）
