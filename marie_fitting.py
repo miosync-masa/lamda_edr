@@ -119,10 +119,15 @@ def loss_fn_jax(raw_params, exps, mat):
 
 @jit
 def predict_flc_from_sim_jax(beta, mat_dict, edr_dict, major_rate=0.6, duration=1.0):
-    """改良版：符号変化検出＋線形補間"""
+    """v3: 符号変化検出＋線形補間＋未到達ケース対応"""
+    
+    # β依存でduration延長（張出し側で長く）
+    duration_eff = duration * (1.0 + 0.4 * jax.nn.relu(beta - 0.5))
+    
+    # シミュレーション準備
     dt = 1e-3
-    N = int(duration/dt) + 1
-    t = jnp.linspace(0, duration, N)
+    N = int(duration_eff/dt) + 1
+    t = jnp.linspace(0, duration_eff, N)
     epsM = major_rate * t
     epsm = beta * epsM
     
@@ -140,39 +145,62 @@ def predict_flc_from_sim_jax(beta, mat_dict, edr_dict, major_rate=0.6, duration=
         'T0': 293.15
     }
     
+    # シミュレーション実行
     res = simulate_lambda_jax(schedule_dict, mat_dict, edr_dict)
     Lambda_smooth = smooth_signal_jax(res["Lambda"], window_size=11)
     
     epsM_trimmed = epsM[:-1]
     Λcrit = edr_dict['Lambda_crit']
     
-    # 1️⃣ 符号変化検出
+    # ===== 1. 符号変化検出による交点探索 =====
     diff = Lambda_smooth[:-1] - Λcrit
+    # 符号が変わる点（負→正）を検出
     sign_change = jnp.maximum(-diff[:-1] * diff[1:], 0.0)
     
-    # 2️⃣ スムーズな重み（符号変化点に集中）
+    # 符号変化点に重みを集中
     w = jnp.exp(50.0 * sign_change)
     w = w / (jnp.sum(w) + 1e-12)
     
-    # 3️⃣ ピーク位置特定と線形補間
+    # 最大重み位置を取得
     idx = jnp.argmax(w)
     idx = jnp.minimum(idx, len(epsM_trimmed)-2)
     
+    # ===== 2. 線形補間による正確な交点 =====
     Λ1 = Lambda_smooth[idx]
     Λ2 = Lambda_smooth[idx+1]
     e1 = epsM_trimmed[idx]
     e2 = epsM_trimmed[idx+1]
     
-    # 線形補間で正確な交点
+    # 線形補間係数
     frac = jnp.clip((Λcrit - Λ1) / (Λ2 - Λ1 + 1e-12), 0.0, 1.0)
-    Em = e1 + frac * (e2 - e1)
+    Em_cross = e1 + frac * (e2 - e1)
     
-    # 安全装置
+    # ===== 3. 未到達ケースのフォールバック =====
+    # Λcritに最も近い点を探す
+    distance_to_crit = jnp.abs(Lambda_smooth - Λcrit)
+    nearest_idx = jnp.argmin(distance_to_crit)
+    nearest_idx = jnp.minimum(nearest_idx, len(epsM_trimmed)-1)
+    Em_nearest = epsM_trimmed[nearest_idx]
+    
+    # ===== 4. miss度合いの計算 =====
+    max_Lambda = jnp.max(Lambda_smooth)
+    # Λcritに届かないほど1.0に近づく
+    miss = jax.nn.sigmoid((Λcrit - max_Lambda) * 8.0)
+    
+    # ===== 5. 交点と最近点のブレンド =====
+    # 届いた場合(miss≈0): Em_cross使用
+    # 届かない場合(miss≈1): Em_nearest使用
+    Em = (1.0 - miss) * Em_cross + miss * Em_nearest
+    
+    # ===== 6. 安全装置 =====
+    # NaN対策と物理的に妥当な範囲に制限
     Em = jnp.where(jnp.isnan(Em), epsM_trimmed[-1], Em)
     Em = jnp.clip(Em, 0.05, 0.8)
     
     em = beta * Em
-    return Em, em, Lambda_smooth
+    
+    # missも返すことで、損失関数でペナルティ追加可能
+    return Em, em, Lambda_smooth, miss
 
 def loss_flc_true_jax(raw_params, flc_pts_data, mat_dict):
     """FLC損失関数"""
