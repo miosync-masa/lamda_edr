@@ -598,123 +598,172 @@ def phase0_unsupervised_learning(
 # =============================================================================
 # Section 5.5: Phase 1 - 純粋なFLCフィッティング（追加！）
 # =============================================================================
-
 def phase1_flc_optimization(
     params_init,
     flc_pts_data: Dict,
     mat_dict: Dict,
-    n_steps: int = 200,
+    n_steps: int = 300,  # 200→300に増やす
     verbose: bool = True
 ) -> Tuple[Dict, List[float]]:
     """
-    Phase 1: FLC専用最適化（純粋な相対誤差最小化版）
+    Phase 1: カリキュラム学習版FLC最適化
     """
     if verbose:
         print("\n" + "="*60)
-        print(" 🎯 Phase 1: Direct Data Fitting (Relative Error)")
+        print(" 🎯 Phase 1: Curriculum FLC Fitting (with Huber + miss)")
         print("="*60)
         print(f"  データ点数: {len(flc_pts_data['path_ratios'])}")
         print(f"  最適化ステップ: {n_steps}")
     
-    # 純粋な相対誤差損失（重み付けなし！）
-    def loss_relative_error(params):
-        edr_dict = transform_params_jax(params)
-        
-        total_rel_error = 0.0
-        for i in range(len(flc_pts_data['path_ratios'])):
-            beta = flc_pts_data['path_ratios'][i]
-            Em_gt = flc_pts_data['major_limits'][i]
-            
-            Em_pred, _, _ = predict_flc_from_sim_jax(beta, mat_dict, edr_dict)
-            
-            # 純粋な相対誤差（重み付け完全排除）
-            rel_error = jnp.abs(Em_pred - Em_gt) / (Em_gt + 1e-8)
-            total_rel_error += rel_error
-        
-        # 平均相対誤差のみ返す（正則化なし）
-        avg_rel_error = total_rel_error / len(flc_pts_data['path_ratios'])
-        
-        # 最小限の滑らかさ制約のみ追加（0.01倍）
-        beta_test = jnp.linspace(-0.6, 0.6, 11)
-        Em_curve = []
-        for b in beta_test:
-            Em, _, _ = predict_flc_from_sim_jax(b, mat_dict, edr_dict)
-            Em_curve.append(Em)
-        Em_array = jnp.array(Em_curve)
-        grad2 = jnp.diff(jnp.diff(Em_array))
-        smoothness = 0.01 * jnp.mean(grad2**2)  # 超弱い正則化
-        
-        return avg_rel_error + smoothness
+    # Huber相対誤差（滑らかな勾配）
+    @jit
+    def huber_relative(pred, target, delta=0.05):
+        rel = (pred - target) / (target + 1e-8)
+        abs_rel = jnp.abs(rel)
+        return jnp.where(
+            abs_rel <= delta,
+            0.5 * rel**2 / delta,
+            abs_rel - 0.5 * delta
+        )
     
-    # オプティマイザ設定（相対誤差用にチューニング）
-    schedule = optax.exponential_decay(
-        init_value=5e-3,  # より積極的に
-        transition_steps=30,
-        decay_rate=0.93
-    )
+    # パラメータマスク生成（形状系のみ更新）
+    def make_param_mask(params, freeze_gain=True):
+        mask = {}
+        shape_keys = ['beta_centers', 'beta_log_widths', 'beta_logit_A_neg', 
+                     'beta_logit_A_pos', 'ks_nodes_b', 'ks_nodes_log_bw', 
+                     'ks_nodes_logit_K', 'logit_triax_sens']
+        gain_keys = ['log_V0', 'log_av', 'log_ad', 'logit_chi', 'Lambda_crit']
+        
+        for k in params.keys():
+            if freeze_gain and any(gk in k for gk in gain_keys):
+                mask[k] = 0.0  # 凍結
+            elif any(sk in k for sk in shape_keys):
+                mask[k] = 1.0  # 更新
+            else:
+                mask[k] = 0.3  # 弱更新
+        return mask
     
-    optimizer = optax.chain(
-        optax.clip_by_global_norm(1.0),  # クリップ緩和
-        optax.adam(learning_rate=schedule)
-    )
+    # カリキュラムスケジュール
+    curriculum = [
+        (0, 100, [0, 1], True),       # Step 0-100: β=-0.5,-0.25のみ, ゲイン凍結
+        (100, 200, [0, 1, 2], True),  # Step 100-200: +β=0.0追加, ゲイン凍結
+        (200, 300, None, False)       # Step 200-300: 全β, 全パラメータ解放
+    ]
     
-    opt_state = optimizer.init(params_init)
     params = params_init
-    grad_fn = jax.grad(loss_relative_error)
-    
-    loss_history = []
-    rel_error_history = []
+    all_history = []
     best_rel_error = float('inf')
     best_params = params_init
     
-    for step in range(n_steps):
-        grads = grad_fn(params)
-        updates, opt_state = optimizer.update(grads, opt_state, params)
-        params = optax.apply_updates(params, updates)
+    for phase_start, phase_end, active_indices, freeze_gain in curriculum:
+        if active_indices is None:
+            active_indices = list(range(len(flc_pts_data['path_ratios'])))
         
-        if step % 20 == 0 or step == n_steps - 1:
-            loss = float(jax.device_get(loss_relative_error(params)))
-            loss_history.append(loss)
+        # フェーズ固有の設定
+        mask = make_param_mask(params, freeze_gain=freeze_gain)
+        lr = 5e-3 * (0.93 ** (phase_start / 50))  # 段階的に減衰
+        
+        # 損失関数（active_indicesのみ）
+        def loss_with_miss(p):
+            edr_dict = transform_params_jax(p)
+            rel_loss = 0.0
+            miss_penalty = 0.0
             
-            # 実際の相対誤差を計算
-            edr_dict = transform_params_jax(params)
-            total_error = 0.0
-            for i in range(len(flc_pts_data['path_ratios'])):
+            for i in active_indices:
                 beta = flc_pts_data['path_ratios'][i]
                 Em_gt = flc_pts_data['major_limits'][i]
-                Em_pred, _, _ = predict_flc_from_sim_jax(beta, mat_dict, edr_dict)
-                error = abs(float(jax.device_get(Em_pred)) - Em_gt) / Em_gt
-                total_error += error
+                
+                # v3版predict（miss付き）を使用
+                Em_pred, _, _, miss = predict_flc_from_sim_jax(
+                    beta, mat_dict, edr_dict
+                )
+                
+                # Huber相対誤差
+                rel_loss += huber_relative(Em_pred, Em_gt, delta=0.04)
+                
+                # missペナルティ（届かない場合に罰）
+                miss_penalty += 0.03 * miss
             
-            avg_error = total_error / len(flc_pts_data['path_ratios'])
-            rel_error_history.append(avg_error)
+            # 滑らかさ制約（最小限）
+            beta_test = jnp.linspace(-0.6, 0.6, 7)
+            Em_curve = []
+            for b in beta_test:
+                Em, _, _, _ = predict_flc_from_sim_jax(b, mat_dict, edr_dict)
+                Em_curve.append(Em)
+            Em_array = jnp.array(Em_curve)
+            grad2 = jnp.diff(jnp.diff(Em_array))
+            smoothness = 0.005 * jnp.mean(grad2**2)
             
-            # ベストパラメータを相対誤差で判定
-            if avg_error < best_rel_error:
-                best_rel_error = avg_error
-                best_params = params
+            n = len(active_indices)
+            return rel_loss/n + miss_penalty/n + smoothness
+        
+        # オプティマイザ（マスク適用）
+        optimizer = optax.chain(
+            optax.clip_by_global_norm(0.5 if freeze_gain else 0.8),
+            optax.masked(
+                optax.adam(learning_rate=lr),
+                mask
+            )
+        )
+        
+        opt_state = optimizer.init(params)
+        grad_fn = jax.grad(loss_with_miss)
+        
+        # フェーズ内最適化
+        for step in range(phase_start, phase_end):
+            grads = grad_fn(params)
+            updates, opt_state = optimizer.update(grads, opt_state, params)
+            params = optax.apply_updates(params, updates)
             
-            if verbose:
-                print(f"  Step {step:3d}: Loss = {loss:.6f}, "
-                      f"相対誤差 = {avg_error*100:.2f}%")
+            # 評価とログ
+            if step % 20 == 0 or step == phase_end - 1:
+                loss_val = float(jax.device_get(loss_with_miss(params)))
+                
+                # 全点での相対誤差計算
+                edr_dict = transform_params_jax(params)
+                total_error = 0.0
+                for i in range(len(flc_pts_data['path_ratios'])):
+                    beta = flc_pts_data['path_ratios'][i]
+                    Em_gt = flc_pts_data['major_limits'][i]
+                    Em_pred, _, _, _ = predict_flc_from_sim_jax(
+                        beta, mat_dict, edr_dict
+                    )
+                    error = jnp.abs(Em_pred - Em_gt) / Em_gt
+                    total_error += float(jax.device_get(error))
+                
+                avg_error = total_error / len(flc_pts_data['path_ratios'])
+                all_history.append(avg_error)
+                
+                # ベスト更新
+                if avg_error < best_rel_error:
+                    best_rel_error = avg_error
+                    best_params = params
+                
+                if verbose:
+                    active_str = f"β={active_indices}" if len(active_indices) < 6 else "全β"
+                    print(f"  Step {step:3d} [{active_str}]: "
+                          f"Loss={loss_val:.4f}, 相対誤差={avg_error*100:.2f}%")
     
+    # 最終評価
     if verbose:
         print(f"\n  ✅ Phase 1完了!")
         print(f"  最良相対誤差: {best_rel_error*100:.2f}%")
         
-        # 各点の詳細表示
+        # 各点の詳細
         edr_dict = transform_params_jax(best_params)
-        print("\n  各点の誤差:")
+        print("\n  各点の最終誤差:")
         for i in range(len(flc_pts_data['path_ratios'])):
             beta = flc_pts_data['path_ratios'][i]
             Em_gt = flc_pts_data['major_limits'][i]
-            Em_pred, _, _ = predict_flc_from_sim_jax(beta, mat_dict, edr_dict)
+            Em_pred, _, _, miss = predict_flc_from_sim_jax(beta, mat_dict, edr_dict)
             Em_pred_val = float(jax.device_get(Em_pred))
+            miss_val = float(jax.device_get(miss))
             error = abs(Em_pred_val - Em_gt) / Em_gt * 100
-            print(f"    β={beta:5.2f}: GT={Em_gt:.3f}, Pred={Em_pred_val:.3f}, "
-                  f"誤差={error:.1f}%")
+            status = "✓" if error < 10 else "△" if error < 20 else "✗"
+            print(f"    {status} β={beta:5.2f}: GT={Em_gt:.3f}, Pred={Em_pred_val:.3f}, "
+                  f"誤差={error:.1f}%, miss={miss_val:.3f}")
     
-    return best_params, rel_error_history
+    return best_params, all_history
 
 # =============================================================================
 # Section 6: Phase 1.5B - 制約付き多様体最適化
