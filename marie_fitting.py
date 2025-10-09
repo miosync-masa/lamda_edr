@@ -118,7 +118,7 @@ def loss_fn_jax(raw_params, exps, mat):
     return total_loss / len(exps)
 
 def predict_flc_from_sim_jax(beta, mat_dict, edr_dict, major_rate=0.6, duration=1.0):
-    """Λ(t)シミュレーションからFLC限界点を抽出"""
+    """Λ(t)シミュレーションからFLC限界点を抽出（改良版）"""
     dt = 1e-3
     N = int(duration/dt) + 1
     t = jnp.linspace(0, duration, N)
@@ -145,12 +145,32 @@ def predict_flc_from_sim_jax(beta, mat_dict, edr_dict, major_rate=0.6, duration=
     
     epsM_trimmed = epsM[:-1]
     
-    # 微分可能な限界点検出
-    exceed = jnp.maximum(Lambda_smooth - edr_dict['Lambda_crit'], 0.0)
-    w = jnp.exp(jnp.minimum(10.0 * exceed, 10.0))
-    w = w / (jnp.sum(w) + 1e-12)
-    Em = jnp.sum(w * epsM_trimmed)
-    Em = jnp.where(jnp.isnan(Em), epsM_trimmed[-1], Em)
+    # 改良版：最初にLambda_critを超える点を重視
+    exceed = Lambda_smooth - edr_dict['Lambda_crit']
+    
+    # sigmoid的な重み（最初の超過点を強調）
+    indices = jnp.arange(len(Lambda_smooth))
+    first_exceed_weight = jax.nn.sigmoid(-0.1 * (indices - 50))  # 早い時刻を優先
+    
+    # 超過量と時刻の両方を考慮
+    exceed_positive = jnp.maximum(exceed, 0.0)
+    w = exceed_positive * first_exceed_weight
+    w = jnp.where(exceed_positive > 0, w, 0.0)  # 超えてない点は完全に無視
+    
+    # 重みがゼロの場合は最大Lambda点を使用
+    has_exceeded = jnp.sum(w) > 1e-6
+    
+    # 正規化と加重平均
+    w_norm = w / (jnp.sum(w) + 1e-12)
+    Em_exceed = jnp.sum(w_norm * epsM_trimmed)
+    
+    # Lambda最大点のひずみ
+    Em_peak = epsM_trimmed[jnp.argmax(Lambda_smooth)]
+    
+    # 超えた場合は加重平均、超えない場合は最大点
+    Em = jnp.where(has_exceeded, Em_exceed, Em_peak)
+    Em = jnp.where(jnp.isnan(Em), Em_peak, Em)  # NaN対策
+    
     em = beta * Em
     
     return Em, em, Lambda_smooth
