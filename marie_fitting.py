@@ -119,19 +119,21 @@ def loss_fn_jax(raw_params, exps, mat):
 
 @jit
 def predict_flc_from_sim_jax(beta, mat_dict, edr_dict, major_rate=0.6, duration=1.0):
-    """v3修正版: JITエラー対応"""
+    """v4: 物理的に正しい完全版"""
     
-    # duration延長は最大値で固定（JIT互換のため）
-    max_duration = 1.4  # 最大1.4秒で固定
+    # β依存でduration延長（張出し側で長く！）
+    duration_eff = duration * (1.0 + 0.3 * jax.nn.relu(beta - 0.5))
     
-    # シミュレーション準備（N固定）
+    # シミュレーション準備
     dt = 1e-3
-    N = int(max_duration/dt) + 1  # 1401点で固定
+    max_duration = 1.4  # 最大値
+    N = int(max_duration/dt) + 1  # 1401点固定
+    actual_duration = jnp.minimum(duration_eff, max_duration)
     t = jnp.linspace(0, max_duration, N)
     
-    # β依存でepsM_rateを調整（別アプローチ）
-    rate_scale = 1.0 / (1.0 + 0.3 * jax.nn.relu(beta - 0.5))
-    epsM = major_rate * rate_scale * t
+    # actual_durationまでのepsM、それ以降は最終値で固定
+    t_mask = t <= actual_duration
+    epsM = jnp.where(t_mask, major_rate * t, major_rate * actual_duration)
     epsm = beta * epsM
     
     schedule_dict = {
@@ -180,9 +182,9 @@ def predict_flc_from_sim_jax(beta, mat_dict, edr_dict, major_rate=0.6, duration=
     nearest_idx = jnp.minimum(nearest_idx, len(epsM_trimmed)-1)
     Em_nearest = epsM_trimmed[nearest_idx]
     
-    # ===== 4. miss計算 =====
+    # ===== 4. miss計算（緩和版） =====
     max_Lambda = jnp.max(Lambda_smooth)
-    miss = jax.nn.sigmoid((Λcrit - max_Lambda) * 8.0)
+    miss = jax.nn.sigmoid((Λcrit - max_Lambda) * 5.0)  # 8→5に緩和
     
     # ===== 5. ブレンド =====
     Em = (1.0 - miss) * Em_cross + miss * Em_nearest
@@ -620,18 +622,20 @@ def phase1_flc_optimization(
     # パラメータマスク生成（形状系のみ更新）
     def make_param_mask(params, freeze_gain=True):
         mask = {}
-        shape_keys = ['beta_centers', 'beta_log_widths', 'beta_logit_A_neg', 
-                     'beta_logit_A_pos', 'ks_nodes_b', 'ks_nodes_log_bw', 
-                     'ks_nodes_logit_K', 'logit_triax_sens']
+        # 実際のパラメータ名に合わせる！
+        shape_keys = ['logit_beta_A', 'logit_beta_bw', 'logit_beta_A_pos', 
+                      'logit_K_scale_draw', 'logit_K_scale_plane', 
+                      'logit_K_scale_biax', 'logit_triax_sens']
         gain_keys = ['log_V0', 'log_av', 'log_ad', 'logit_chi', 'Lambda_crit']
         
         for k in params.keys():
             if freeze_gain and any(gk in k for gk in gain_keys):
-                mask[k] = 0.0  # 凍結
+                mask[k] = 0.0
             elif any(sk in k for sk in shape_keys):
-                mask[k] = 1.0  # 更新
+                mask[k] = 1.0  # 形状パラメータ更新
             else:
-                mask[k] = 0.3  # 弱更新
+                mask[k] = 0.3
+        
         return mask
     
     # カリキュラムスケジュール
