@@ -1098,6 +1098,7 @@ __all__ = [
     
     # 最適化
     'phase0_unsupervised_learning',
+    'phase1_flc_optimization',
     'phase_15b_manifold_optimization',
 
     # 結果保存
