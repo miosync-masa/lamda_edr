@@ -397,9 +397,9 @@ def loss_binary_manifold(
 # =============================================================================
 # Section 5: Phase 0 - 教師なし物理制約学習
 # =============================================================================
-
 def phase0_unsupervised_learning(
     mat_dict: Dict,
+    flc_pts_data: Dict = None,  # 追加：FLC実験データ
     n_steps: int = 300,
     verbose: bool = True
 ) -> Tuple[Dict, List[float]]:
@@ -410,6 +410,22 @@ def phase0_unsupervised_learning(
         print("\n" + "="*60)
         print(" 🎂 Phase 0: Unsupervised FLC Manifold Learning")
         print("="*60)
+    
+    # 実験データからV字深さ目標を計算
+    target_v_ratio = None
+    if flc_pts_data is not None:
+        betas = flc_pts_data['path_ratios']
+        majors = flc_pts_data['major_limits']
+        
+        # β=0に最も近いインデックス
+        center_idx = jnp.argmin(jnp.abs(betas))
+        # エッジの平均
+        edge_avg = (majors[0] + majors[-1]) / 2
+        # V字の深さ比率
+        target_v_ratio = majors[center_idx] / edge_avg
+        
+        if verbose:
+            print(f"  実験V字深さ目標: {float(target_v_ratio):.3f}")
     
     # 安定版FLC予測
     def predict_flc_stable(path_ratio, edr_dict):
@@ -481,8 +497,16 @@ def phase0_unsupervised_learning(
         range_loss = jnp.mean(jnp.maximum(0, 0.1 - Em_array)**2) + \
                      jnp.mean(jnp.maximum(0, Em_array - 1.0)**2)
         
+        # V字深さ損失（実験データがある場合）
+        if target_v_ratio is not None:
+            edge_avg = (Em_array[0] + Em_array[-1]) / 2
+            v_depth = Em_array[center] / (edge_avg + 1e-8)
+            depth_loss = 0.2 * (v_depth - target_v_ratio)**2
+        else:
+            depth_loss = 0.0
+        
         total_loss = monotonicity_loss + convexity_loss + symmetry_loss + \
-                    smoothness_loss + range_loss
+                    smoothness_loss + range_loss + depth_loss
         
         return jnp.where(jnp.isnan(total_loss), 1e10, total_loss)
     
