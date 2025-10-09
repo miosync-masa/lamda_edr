@@ -667,6 +667,9 @@ def evaluate_binary_classification(
         print(" 📊 Binary Classification Evaluation")
         print("="*60)
     
+    # ManifoldAnalyzerを初期化！
+    analyzer = ManifoldAnalyzer()
+    
     correct = 0
     results = []
     
@@ -693,8 +696,8 @@ def evaluate_binary_classification(
                 print(f"  相対スコア: {float(jax.device_get(classification['relative_score'])):.4f}")
                 print(f"  確信度: {conf:.2%}")
         else:
-            # 安全多様体のみの判定
-            safety_score = compute_safety_score_jax(Lambda, safe_manifold)
+            # 安全多様体のみの判定（修正！）
+            safety_score = analyzer.compute_safety_score(Lambda, safe_manifold)
             safety_score_val = float(jax.device_get(safety_score))
             
             # 動的閾値を使用（safe_manifoldの統計から）
