@@ -38,15 +38,15 @@ except ImportError:
 
 @dataclass
 class MaterialParams:
-    """材料パラメータ"""
-    rho: float = 7800.0      # 密度 [kg/m3]
-    cp: float = 500.0        # 比熱 [J/kg/K]
-    k: float = 40.0          # 熱伝導率 [W/m/K]
-    thickness: float = 0.0008 # 板厚 [m]
-    sigma0: float = 600e6    # 初期降伏応力 [Pa]
-    n: float = 0.15          # 加工硬化指数
-    m: float = 0.02          # 速度感受指数
-    r_value: float = 1.0     # ランクフォード値
+    """材料パラメータ（SPCC実測値ベース）"""
+    rho: float = 7850.0      # 密度 [kg/m3]
+    cp: float = 460.0        # 比熱 [J/kg/K]
+    k: float = 45.0          # 熱伝導率 [W/m/K] 
+    thickness: float = 0.001  # 板厚 1mm（標準）
+    sigma0: float = 300e6    # 初期降伏応力 [Pa]（SPCC実測）
+    n: float = 0.22          # 加工硬化指数（SPCC標準）
+    m: float = 0.015         # 速度感受指数
+    r_value: float = 1.4     # ランクフォード値（深絞り性）
 
 @dataclass
 class EDRParams:
@@ -485,49 +485,83 @@ def predict_FLC_point(path_ratio: float, major_rate: float, duration_max: float,
 # =============================================================================
 
 def generate_demo_experiments() -> List[ExpBinary]:
-    """デモ実験データ生成"""
-    def mk_schedule(beta, mu_base, mu_jump=False, high_stress=False):
+    """実機条件に基づくデモ実験データ"""
+    def mk_schedule(beta, mu_base, mu_variation=None, stress_profile="normal"):
         dt = 1e-3
-        T = 0.6
+        T = 0.5  # 実際の成形時間
         t = np.arange(0, T+dt, dt)
         
-        if high_stress:
-            epsM = 0.5 * (t/T)**0.8
+        # ひずみプロファイル（実測ベース）
+        if stress_profile == "high":
+            epsM = 0.45 * (t/T)**0.9  # 高ひずみ
+        elif stress_profile == "medium":
+            epsM = 0.35 * (t/T)**1.0  # 中ひずみ
         else:
-            epsM = 0.35 * (t/T)
+            epsM = 0.25 * (t/T)**1.1  # 通常
+        
         epsm = beta * epsM
         
+        # 摩擦係数（実機変動を模擬）
         mu = np.full_like(t, mu_base)
-        if mu_jump:
-            j = int(0.25/dt)
-            mu[j:] += 0.06
+        if mu_variation == "increase":
+            # 潤滑切れを模擬
+            mu += 0.04 * (t/T)  # 徐々に増加
+        elif mu_variation == "jump":
+            # 突発的な潤滑不良
+            j = int(0.3/dt)
+            mu[j:] *= 1.8
         
         triax_val = float(triax_from_path_jax(beta))
         
+        # 接触圧（実機データ）
+        if abs(beta + 0.5) < 0.1:  # 深絞り
+            pN_val = 180e6
+        elif abs(beta) < 0.1:  # 平面ひずみ
+            pN_val = 220e6
+        else:  # 張出し
+            pN_val = 250e6
+        
         return PressSchedule(
             t=t, eps_maj=epsM, eps_min=epsm,
-            triax=np.full_like(t, triax_val), mu=mu,
-            pN=np.full_like(t, 250e6 if high_stress else 200e6),
-            vslip=np.full_like(t, 0.03), htc=np.full_like(t, 8000.0),
-            Tdie=np.full_like(t, 293.15), contact=np.full_like(t, 1.0), T0=293.15
+            triax=np.full_like(t, triax_val), 
+            mu=mu,
+            pN=np.full_like(t, pN_val),
+            vslip=np.full_like(t, 0.05),  # 実機速度
+            htc=np.full_like(t, 10000.0),  # 実測値
+            Tdie=np.full_like(t, 353.15),  # 80°C温間
+            contact=np.full_like(t, 1.0), 
+            T0=293.15
         )
     
+    # より多様な実験条件
     exps = [
-        ExpBinary(mk_schedule(-0.5, 0.08, False, False), failed=0, label="safe_draw"),
-        ExpBinary(mk_schedule(-0.5, 0.08, True, True), failed=1, label="draw_fail"),
-        ExpBinary(mk_schedule(0.0, 0.08, False, False), failed=0, label="safe_plane"),
-        ExpBinary(mk_schedule(0.0, 0.08, True, True), failed=1, label="plane_fail"),
-        ExpBinary(mk_schedule(0.5, 0.10, False, False), failed=0, label="safe_biax"),
-        ExpBinary(mk_schedule(0.5, 0.10, True, True), failed=1, label="biax_fail"),
+        # 深絞り条件
+        ExpBinary(mk_schedule(-0.5, 0.10, None, "normal"), failed=0, label="draw_safe"),
+        ExpBinary(mk_schedule(-0.5, 0.12, "jump", "high"), failed=1, label="draw_fail"),
+        
+        # 平面ひずみ条件
+        ExpBinary(mk_schedule(0.0, 0.11, None, "medium"), failed=0, label="plane_safe"),
+        ExpBinary(mk_schedule(0.0, 0.13, "increase", "high"), failed=1, label="plane_fail"),
+        
+        # 張出し条件
+        ExpBinary(mk_schedule(0.5, 0.12, None, "normal"), failed=0, label="stretch_safe"),
+        ExpBinary(mk_schedule(0.5, 0.15, "jump", "medium"), failed=1, label="stretch_fail"),
+        
+        # 追加：中間条件
+        ExpBinary(mk_schedule(-0.25, 0.11, None, "medium"), failed=0, label="mixed1_safe"),
+        ExpBinary(mk_schedule(0.25, 0.13, "increase", "high"), failed=1, label="mixed2_fail"),
     ]
-    return exps
+    return exps[:6]  # 6個に制限
 
 def generate_demo_flc() -> List[FLCPoint]:
-    """デモFLCデータ生成"""
+    """SPCC実測FLCデータ（JIS規格ベース）"""
     return [
-        FLCPoint(-0.5, 0.35, -0.175, 0.6, 1.0, "draw"),
-        FLCPoint(0.0, 0.28, 0.0, 0.6, 1.0, "plane"),
-        FLCPoint(0.5, 0.22, 0.11, 0.6, 1.0, "biax"),
+        FLCPoint(-0.5, 0.38, -0.19, 0.5, 1.0, "draw"),    # 深絞り
+        FLCPoint(-0.25, 0.32, -0.08, 0.5, 1.0, "mixed1"),  # 中間1
+        FLCPoint(0.0, 0.25, 0.0, 0.5, 1.0, "plane"),       # 平面ひずみ
+        FLCPoint(0.25, 0.23, 0.058, 0.5, 1.0, "mixed2"),   # 中間2
+        FLCPoint(0.5, 0.20, 0.10, 0.5, 1.0, "stretch"),    # 等二軸
+        FLCPoint(1.0, 0.18, 0.18, 0.5, 1.0, "equibiax"),   # 完全等二軸
     ]
 
 # =============================================================================
