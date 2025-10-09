@@ -118,7 +118,7 @@ def loss_fn_jax(raw_params, exps, mat):
     return total_loss / len(exps)
 
 def predict_flc_from_sim_jax(beta, mat_dict, edr_dict, major_rate=0.6, duration=1.0):
-    """Λ(t)シミュレーションからFLC限界点を抽出（改良版）"""
+    """Λ(t)シミュレーションからFLC限界点を抽出（β依存スケーリング版）"""
     dt = 1e-3
     N = int(duration/dt) + 1
     t = jnp.linspace(0, duration, N)
@@ -140,39 +140,28 @@ def predict_flc_from_sim_jax(beta, mat_dict, edr_dict, major_rate=0.6, duration=
     }
     
     res = simulate_lambda_jax(schedule_dict, mat_dict, edr_dict)
-    Lambda_raw = res["Lambda"]
-    Lambda_smooth = smooth_signal_jax(Lambda_raw, window_size=11)
+    Lambda_smooth = smooth_signal_jax(res["Lambda"], window_size=11)
     
     epsM_trimmed = epsM[:-1]
     
-    # 改良版：最初にLambda_critを超える点を重視
-    exceed = Lambda_smooth - edr_dict['Lambda_crit']
+    # β依存でLambda_critを調整（張出し側は閾値を上げる）
+    # β=-0.5で0.95倍、β=0で1.0倍、β=1.0で1.15倍くらい
+    crit_scale = 1.0 + 0.15 * beta
+    Lambda_crit_eff = edr_dict['Lambda_crit'] * jnp.clip(crit_scale, 0.9, 1.2)
     
-    # sigmoid的な重み（最初の超過点を強調）
-    indices = jnp.arange(len(Lambda_smooth))
-    first_exceed_weight = jax.nn.sigmoid(-0.1 * (indices - 50))  # 早い時刻を優先
+    # シンプルな限界判定
+    exceed_mask = Lambda_smooth > Lambda_crit_eff
+    first_exceed_idx = jnp.argmax(exceed_mask)
+    has_exceeded = jnp.any(exceed_mask)
     
-    # 超過量と時刻の両方を考慮
-    exceed_positive = jnp.maximum(exceed, 0.0)
-    w = exceed_positive * first_exceed_weight
-    w = jnp.where(exceed_positive > 0, w, 0.0)  # 超えてない点は完全に無視
-    
-    # 重みがゼロの場合は最大Lambda点を使用
-    has_exceeded = jnp.sum(w) > 1e-6
-    
-    # 正規化と加重平均
-    w_norm = w / (jnp.sum(w) + 1e-12)
-    Em_exceed = jnp.sum(w_norm * epsM_trimmed)
-    
-    # Lambda最大点のひずみ
-    Em_peak = epsM_trimmed[jnp.argmax(Lambda_smooth)]
-    
-    # 超えた場合は加重平均、超えない場合は最大点
-    Em = jnp.where(has_exceeded, Em_exceed, Em_peak)
-    Em = jnp.where(jnp.isnan(Em), Em_peak, Em)  # NaN対策
+    # 超えた場合はその点、超えない場合は最大Lambda位置
+    Em = jnp.where(
+        has_exceeded,
+        epsM_trimmed[first_exceed_idx],
+        epsM_trimmed[jnp.argmax(Lambda_smooth)]
+    )
     
     em = beta * Em
-    
     return Em, em, Lambda_smooth
 
 def loss_flc_true_jax(raw_params, flc_pts_data, mat_dict):
