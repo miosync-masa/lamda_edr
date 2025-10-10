@@ -166,6 +166,83 @@ def make_boundary_constraint(flc_points, pmap):
     return NonlinearConstraint(cons_vec, lower, upper)
 
 # =============================================================================
+# Section 3.5: 重み付き制約（安定性改善版）
+# =============================================================================
+
+def make_boundary_constraint_weighted(flc_points, pmap):
+    """深絞り側を重視した重み付き制約"""
+    def cons_vec(z):
+        p = pmap.to_physical(z)
+        errors = []
+        for (b, Em) in flc_points:
+            Em_pred = compute_flc_point(p, b)
+            # 深絞り側（β < -0.3）には2倍の重み
+            weight = 2.0 if b < -0.3 else 1.0
+            errors.append((Em_pred - Em) * weight / max(Em, 1e-3))
+        return np.array(errors, float)
+    
+    n = len(flc_points)
+    eps_rel = 3e-3
+    lower = -np.full(n, eps_rel)
+    upper = np.full(n, eps_rel)
+    return NonlinearConstraint(cons_vec, lower, upper)
+
+def solve_constrained_edr_stable(flc_points: List[Tuple[float, float]], 
+                                 verbose: bool = True) -> Tuple[Dict, object]:
+    """安定版：狭い範囲で重み付き最適化"""
+    
+    # より狭い物理範囲（CVを下げる）
+    physics_bounds_stable = {
+        'K_scale': (0.9, 1.2),        # ±20%に制限
+        'K_scale_draw': (0.95, 1.25),
+        'K_scale_plane': (0.75, 0.85),
+        'K_scale_biax': (0.95, 1.15),
+        'beta_A': (0.08, 0.18),       # 狭める
+        'beta_bw': (0.35, 0.50),      # 大幅に狭める
+        'beta_A_pos': (0.06, 0.10),  # 狭める
+    }
+    
+    pmap = ParamMap(physics_bounds_stable)
+    z0 = get_better_initial_guess(flc_points, physics_bounds_stable)
+    
+    # 重み付き制約を使用
+    nlcons = make_boundary_constraint_weighted(flc_points, pmap)
+    
+    beta_min = min(b for b, _ in flc_points)
+    beta_max = max(b for b, _ in flc_points)
+    beta_grid = np.linspace(beta_min, beta_max, 41)
+    
+    fun = lambda z: regularizer(z, pmap, beta_grid)
+    
+    options = {
+        'maxiter': 3000,
+        'verbose': 2 if verbose else 0,
+        'gtol': 1e-8,
+        'xtol': 1e-8,
+        'barrier_tol': 1e-6,
+        'initial_constr_penalty': 1.0,
+    }
+    
+    res = minimize(fun, z0, 
+                  method='trust-constr',
+                  constraints=[nlcons],
+                  options=options)
+    
+    params_phys = pmap.to_physical(res.x)
+    
+    if verbose:
+        print("\n" + "="*60)
+        print("最適化完了（安定版）")
+        print(f"Success: {res.success}")
+        print(f"目的関数値: {res.fun:.6f}")
+        print(f"制約違反: {np.max(np.abs(res.constr)):.6e}")
+        print("\n最適パラメータ:")
+        for k, v in params_phys.items():
+            print(f"  {k:15s}: {v:.6e}")
+    
+    return params_phys, res
+
+# =============================================================================
 # Section 4: 目的関数（空間の滑らかさ）
 # =============================================================================
 
