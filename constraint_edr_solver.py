@@ -193,13 +193,13 @@ def solve_constrained_edr_stable(flc_points: List[Tuple[float, float]],
     
     # より狭い物理範囲（CVを下げる）
     physics_bounds_stable = {
-        'K_scale': (0.9, 1.2),        # ±20%に制限
-        'K_scale_draw': (0.95, 1.25),
-        'K_scale_plane': (0.75, 0.85),
-        'K_scale_biax': (0.95, 1.15),
-        'beta_A': (0.08, 0.18),       # 狭める
-        'beta_bw': (0.35, 0.50),      # 大幅に狭める
-        'beta_A_pos': (0.06, 0.10),  # 狭める
+        'K_scale': (0.8, 1.3),        # 少し広げる
+        'K_scale_draw': (0.9, 1.3),   
+        'K_scale_plane': (0.7, 0.9),   # 少し広げる
+        'K_scale_biax': (0.9, 1.2),    
+        'beta_A': (0.05, 0.2),         # 広げる
+        'beta_bw': (0.25, 0.6),        # 下限を0.25に戻す！
+        'beta_A_pos': (0.05, 0.12),    # 少し広げる
     }
     
     pmap = ParamMap(physics_bounds_stable)
