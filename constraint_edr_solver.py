@@ -407,13 +407,13 @@ if __name__ == "__main__":
     
     # physics_boundsも調整
     physics_bounds_v2 = {
-        'K_scale': (0.5, 2.0),
-        'K_scale_draw': (0.8, 1.5),
-        'K_scale_plane': (0.75, 1.25),   # 少し広げる
-        'K_scale_biax': (0.6, 1.1),      # 広げる
-        'beta_A': (0.05, 0.3),
-        'beta_bw': (0.25, 1.2),          # 下限を緩め
-        'beta_A_pos': (0.05, 0.25),
+        'K_scale': (0.9, 1.2),      # 適度
+        'K_scale_draw': (0.95, 1.25),
+        'K_scale_plane': (0.75, 0.85),
+        'K_scale_biax': (0.95, 1.15),
+        'beta_A': (0.08, 0.15),     # 少し狭める
+        'beta_bw': (0.25, 0.45),    # ← ここがポイント！
+        'beta_A_pos': (0.06, 0.10),
     }
 
     # 初期値を改善して実行
