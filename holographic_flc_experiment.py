@@ -355,6 +355,199 @@ def compute_boundary_info_packet_ultimate(params_dict, beta_boundary, n_samples=
     return Ξ
 
 # =============================================================================
+# Section 4.5: 非可換境界（Noncommutative Boundary）
+# =============================================================================
+
+def compute_theta_eff(Xi_packet: Dict, epsilon: float = 1e-6) -> np.ndarray:
+    """
+    非可換パラメータθ_effの計算
+    
+    θ_eff = ω_Λ / (|∂_nΛ| × |j_n| + ε)
+    
+    物理的意味:
+      - 渦が強い（ω_Λ大）→ 非可換性大
+      - 境界が硬い（|∂_nΛ|大）→ 非可換性小  
+      - 駆動が強い（|j_n|大）→ 非可換性小
+    
+    Args:
+        Xi_packet: 境界情報パケット（compute_boundary_info_packet_ultimate の出力）
+        epsilon: ゼロ除算防止の小さな値
+        
+    Returns:
+        theta_eff: 各β点での非可換パラメータ [array]
+    """
+    omega = Xi_packet['vorticity']      # ω_Λ（渦度・B場）
+    grad_n = Xi_packet['normal_grad']   # |∂_nΛ|（法線勾配・境界の硬さ）
+    flux_n = Xi_packet['normal_flux']   # j_n（法線流束・駆動）
+    
+    # 非可換パラメータの計算
+    denominator = np.abs(grad_n) * (np.abs(flux_n) + epsilon)
+    theta_eff = omega / (denominator + epsilon)  # 二重安全策
+    
+    return theta_eff
+
+
+def compute_noncommutative_signature(
+    beta_values: np.ndarray,
+    theta_eff: np.ndarray,
+    field_f: np.ndarray,
+    field_g: np.ndarray,
+) -> Dict:
+    """
+    非可換性のシグネチャΔ_NCの計算
+    
+    Δ_NC = Σ[f_{i+1}g_i - f_ig_{i+1}]θ_eff(β_i)
+    
+    可換なら Δ_NC = 0
+    非可換なら Δ_NC ≠ 0
+    
+    Args:
+        beta_values: β値の配列
+        theta_eff: 非可換パラメータの配列
+        field_f: 第1の場（例：誤差場）
+        field_g: 第2の場（例：マージン |1-Λ|）
+        
+    Returns:
+        result: {
+            'Delta_NC': 総和,
+            'contributions': 各点の寄与,
+            'mean_abs': 平均絶対値,
+            'std': 標準偏差,
+        }
+    """
+    n = len(beta_values)
+    
+    # 順序依存項の計算
+    delta_nc = 0.0
+    contributions = []
+    
+    for i in range(n - 1):
+        # 非可換項: [f, g]_θ = (f_{i+1}g_i - f_ig_{i+1})θ_eff
+        nc_term = (field_f[i+1] * field_g[i] - 
+                   field_f[i] * field_g[i+1]) * theta_eff[i]
+        delta_nc += nc_term
+        contributions.append(nc_term)
+    
+    contributions = np.array(contributions)
+    
+    # 統計量
+    result = {
+        'Delta_NC': delta_nc,
+        'contributions': contributions,
+        'mean_abs': np.mean(np.abs(contributions)),
+        'std': np.std(contributions),
+        'max_abs': np.max(np.abs(contributions)),
+    }
+    
+    return result
+
+
+def diagnose_noncommutative_boundary_ultimate(
+    params: Dict,
+    flc_points: List[Tuple[float, float]],
+    beta_fine: np.ndarray = None,
+    verbose: bool = True,
+) -> Dict:
+    """
+    非可換境界の完全診断（究極版）
+    
+    CSP制約下で検出されたΛ=1境界上に、
+    非可換幾何（AdS/CFT対応のCFT側）が
+    実現されているかを診断する。
+    
+    Args:
+        params: 最適化されたパラメータ辞書
+        flc_points: FLCデータ点
+        beta_fine: 診断用の細かいβ配列（Noneなら自動生成）
+        verbose: 結果表示のON/OFF
+        
+    Returns:
+        result: {
+            'beta': β配列,
+            'theta_eff': 非可換パラメータ,
+            'Xi_packet': 境界情報パケット,
+            'nc_signature': 非可換シグネチャ,
+            'Lambda': Λ場,
+            'error_field': 誤差場,
+            'margin_field': マージン場,
+        }
+    """
+    if beta_fine is None:
+        beta_fine = np.linspace(-0.5, 1.0, 200)
+    
+    # 1. Λ場の計算（既存）
+    Lambda_field = np.array([
+        compute_Lambda_ultimate(params, beta) for beta in beta_fine
+    ])
+    
+    # 2. Ξパケットの計算（既存）
+    Xi_packet = compute_boundary_info_packet_ultimate(
+        params, beta_fine, Lambda_field, verbose=False
+    )
+    
+    # 3. θ_effの計算（新規）
+    theta_eff = compute_theta_eff(Xi_packet)
+    
+    # 4. 誤差場とマージンの計算
+    Em_pred = np.array([
+        compute_Em_ultimate(params, beta, compute_Lambda_ultimate(params, beta))
+        for beta in beta_fine
+    ])
+    
+    # FLC実測値の補間
+    beta_obs = np.array([b for b, _ in flc_points])
+    Em_obs = np.array([e for _, e in flc_points])
+    Em_interp = np.interp(beta_fine, beta_obs, Em_obs)
+    
+    error_field = Em_pred - Em_interp
+    margin_field = np.abs(1.0 - Lambda_field)
+    
+    # 5. 非可換性の検出（新規）
+    nc_signature = compute_noncommutative_signature(
+        beta_fine, theta_eff, error_field, margin_field
+    )
+    
+    # 6. 結果の整理
+    result = {
+        'beta': beta_fine,
+        'theta_eff': theta_eff,
+        'Xi_packet': Xi_packet,
+        'nc_signature': nc_signature,
+        'Lambda': Lambda_field,
+        'error_field': error_field,
+        'margin_field': margin_field,
+    }
+    
+    # 7. 結果表示
+    if verbose:
+        print("\n" + "="*60)
+        print("非可換境界診断（究極版）")
+        print("="*60)
+        print(f"\n【非可換パラメータ θ_eff】")
+        print(f"  平均: {np.mean(np.abs(theta_eff)):.6e}")
+        print(f"  最大: {np.max(np.abs(theta_eff)):.6e}")
+        print(f"  最小: {np.min(np.abs(theta_eff)):.6e}")
+        print(f"  標準偏差: {np.std(theta_eff):.6e}")
+        
+        print(f"\n【非可換シグネチャ Δ_NC】")
+        print(f"  Δ_NC = {nc_signature['Delta_NC']:.6e}")
+        print(f"  平均寄与: {nc_signature['mean_abs']:.6e}")
+        print(f"  最大寄与: {nc_signature['max_abs']:.6e}")
+        
+        # 判定
+        if np.abs(nc_signature['Delta_NC']) > 1e-6:
+            print(f"  ✓ 非可換性検出！（Δ_NC ≠ 0）")
+        else:
+            print(f"  - 可換極限近傍（Δ_NC ≈ 0）")
+        
+        print(f"\n【Ξパケット統計】")
+        print(f"  ω_Λ平均: {np.mean(np.abs(Xi_packet['vorticity'])):.6e}")
+        print(f"  |∂_nΛ|平均: {np.mean(np.abs(Xi_packet['normal_grad'])):.6e}")
+        print(f"  j_n平均: {np.mean(np.abs(Xi_packet['normal_flux'])):.6e}")
+    
+    return result
+
+# =============================================================================
 # Section 5: 制約と最適化（超緩和版）
 # =============================================================================
 
@@ -672,6 +865,200 @@ def solve_homotopy_ultimate_rho(flc_points: List[Tuple[float, float]],
 
     return params_phys, res
 
+    def sweep_rho_commutative_limit(
+        flc_points: List[Tuple[float, float]],
+        rho_values: List[float] = None,
+        physics_bounds: Dict = None,
+    ) -> Dict:
+        """
+        ρスイープによる可換極限の検証
+        
+        ρ → 0 で θ_eff → 0 となることを確認
+        
+        Args:
+            flc_points: FLCデータ点
+            rho_values: テストするρ値のリスト（Noneなら自動）
+            physics_bounds: 物理的境界条件
+            
+        Returns:
+            sweep_result: {
+                'rho_values': ρ配列,
+                'theta_eff_mean': 各ρでの<|θ_eff|>,
+                'Delta_NC': 各ρでのΔ_NC,
+                'params_list': 各ρでの最適パラメータ,
+            }
+        """
+        if rho_values is None:
+            rho_values = [0.005, 0.01, 0.02, 0.04, 0.08]
+        
+        if physics_bounds is None:
+            physics_bounds = {
+                'E_gain': (0.5, 3.0),
+                'gamma': (0.5, 1.0),
+                'eta': (-3.0, 5.0),
+                'alpha': (1.5, 2.5),
+                'beta_A': (-0.5, 0.5),
+                'beta_bw': (0.0, 0.5),
+                'beta_A_pos': (0.0, 0.2),
+            }
+        
+        print("\n" + "="*60)
+        print("ρスイープ実験（可換極限の検証）")
+        print("="*60)
+        
+        theta_eff_means = []
+        delta_nc_values = []
+        params_list = []
+        
+        for i, rho in enumerate(rho_values):
+            print(f"\n--- ρ = {rho:.4f} ({i+1}/{len(rho_values)}) ---")
+            
+            # ρ固定で最適化（簡易版：±1%制約のみ）
+            physics_bounds_fixed = physics_bounds.copy()
+            physics_bounds_fixed['rho'] = (rho, rho)  # 固定
+            
+            params, _ = solve_homotopy_ultimate_rho(
+                flc_points,
+                physics_bounds_fixed,
+                STABLE_PARAMS_FROZEN,
+                eps_schedule=[1e-2],  # ±1%のみ（高速化）
+                delta_schedule=[0.01],
+                verbose=False,
+            )
+            
+            # 非可換診断
+            nc_result = diagnose_noncommutative_boundary_ultimate(
+                params, flc_points, verbose=False
+            )
+            
+            theta_mean = np.mean(np.abs(nc_result['theta_eff']))
+            delta_nc = nc_result['nc_signature']['Delta_NC']
+            
+            theta_eff_means.append(theta_mean)
+            delta_nc_values.append(delta_nc)
+            params_list.append(params)
+            
+            print(f"  <|θ_eff|> = {theta_mean:.6e}")
+            print(f"  Δ_NC = {delta_nc:.6e}")
+        
+        # 結果プロット
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        
+        # (A) θ_eff vs ρ
+        ax = axes[0]
+        ax.plot(rho_values, theta_eff_means, 'o-', linewidth=2, markersize=8)
+        ax.set_xlabel('ρ (boundary control)', fontsize=12)
+        ax.set_ylabel('<|θ_eff|>', fontsize=12)
+        ax.set_title('Commutative Limit:\nθ_eff → 0 as ρ → 0', 
+                    fontsize=12, fontweight='bold')
+        ax.grid(alpha=0.3)
+        ax.set_xscale('log')
+        ax.set_yscale('log')
+        
+        # (B) Δ_NC vs ρ
+        ax = axes[1]
+        ax.plot(rho_values, np.abs(delta_nc_values), 'o-', 
+                linewidth=2, markersize=8, color='red')
+        ax.set_xlabel('ρ', fontsize=12)
+        ax.set_ylabel('|Δ_NC|', fontsize=12)
+        ax.set_title('Order Dependence vs ρ', fontsize=12, fontweight='bold')
+        ax.grid(alpha=0.3)
+        ax.set_xscale('log')
+        ax.set_yscale('log')
+        
+        plt.tight_layout()
+        plt.savefig('commutative_limit_sweep.png', dpi=150, bbox_inches='tight')
+        print("\nρスイープ図を保存: commutative_limit_sweep.png")
+        plt.show()
+        
+        return {
+            'rho_values': np.array(rho_values),
+            'theta_eff_mean': np.array(theta_eff_means),
+            'Delta_NC': np.array(delta_nc_values),
+            'params_list': params_list,
+        }
+
+# =============================================================================
+# Section 5.5: 非可換境界の可視化関数
+# =============================================================================
+
+def plot_noncommutative_boundary_ultimate(result: Dict, save_path: str = None):
+    """
+    非可換境界の可視化（究極版）
+    
+    4つのサブプロット:
+      (A) θ_eff分布
+      (B) Ξパケット3成分
+      (C) 非可換寄与Δ_NC
+      (D) θ_eff vs ω_Λ 相関
+    
+    Args:
+        result: diagnose_noncommutative_boundary_ultimate の出力
+        save_path: 保存先パス（Noneなら保存しない）
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    
+    beta = result['beta']
+    theta_eff = result['theta_eff']
+    Xi = result['Xi_packet']
+    nc_sig = result['nc_signature']
+    
+    # (A) θ_effの分布
+    ax = axes[0, 0]
+    ax.plot(beta, theta_eff, 'b-', linewidth=2, label='θ_eff')
+    ax.axhline(0, color='k', linestyle='--', alpha=0.3)
+    ax.fill_between(beta, 0, theta_eff, alpha=0.2)
+    ax.set_xlabel('β (strain ratio)', fontsize=12)
+    ax.set_ylabel('θ_eff (noncommutativity)', fontsize=12)
+    ax.set_title(f'(A) Noncommutative Parameter\n<|θ_eff|> = {np.mean(np.abs(theta_eff)):.3e}', 
+                 fontsize=12, fontweight='bold')
+    ax.legend(fontsize=10)
+    ax.grid(alpha=0.3)
+    
+    # (B) Ξの3成分
+    ax = axes[0, 1]
+    ax.plot(beta, Xi['vorticity'], 'r-', linewidth=2, label='ω_Λ (vorticity/B-field)')
+    ax.plot(beta, Xi['normal_grad'], 'g-', linewidth=2, label='|∂_nΛ| (hardness)')
+    ax.plot(beta, Xi['normal_flux'], 'b-', linewidth=2, label='j_n (flux)')
+    ax.set_xlabel('β', fontsize=12)
+    ax.set_ylabel('Ξ components', fontsize=12)
+    ax.set_title('(B) Boundary Information Packet (Ξ)', fontsize=12, fontweight='bold')
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.3)
+    
+    # (C) 順序依存性の寄与
+    ax = axes[1, 0]
+    contributions = nc_sig['contributions']
+    colors = ['red' if c > 0 else 'blue' for c in contributions]
+    ax.bar(range(len(contributions)), contributions, color=colors, alpha=0.7)
+    ax.axhline(0, color='k', linestyle='-', linewidth=1)
+    ax.set_xlabel('segment index', fontsize=12)
+    ax.set_ylabel('NC contribution [f,g]_θ', fontsize=12)
+    ax.set_title(f"(C) Order Dependence\nΔ_NC = {nc_sig['Delta_NC']:.6e}", 
+                 fontsize=12, fontweight='bold')
+    ax.grid(alpha=0.3, axis='y')
+    
+    # (D) θ_eff vs ω_Λ の相関
+    ax = axes[1, 1]
+    scatter = ax.scatter(Xi['vorticity'], theta_eff, 
+                        c=np.abs(result['Lambda'] - 1.0), 
+                        cmap='viridis', alpha=0.6, s=30)
+    ax.set_xlabel('ω_Λ (vorticity)', fontsize=12)
+    ax.set_ylabel('θ_eff', fontsize=12)
+    ax.set_title('(D) θ_eff vs B-field (ω_Λ)\ncolor = |Λ-1|', 
+                 fontsize=12, fontweight='bold')
+    ax.grid(alpha=0.3)
+    cbar = plt.colorbar(scatter, ax=ax)
+    cbar.set_label('|Λ-1|', fontsize=10)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"\n非可換境界図を保存: {save_path}")
+    
+    return fig   
+
 # =============================================================================
 # Section 6: クイック診断
 # =============================================================================
@@ -950,6 +1337,30 @@ def run_holographic_experiment_ultimate():
 
     Sigma = extract_critical_boundary_ultimate(params_opt, beta_range)
 
+    # ============================================================
+    # 非可換境界診断（AdS/CFT対応）
+    # ============================================================
+    print("\n" + "="*60)
+    print("非可換境界診断（AdS/CFT対応）")
+    print("="*60)
+    
+    nc_result = diagnose_noncommutative_boundary_ultimate(
+        params_opt, 
+        flc_points,
+        verbose=True
+    )
+    
+    # 可視化
+    fig_nc = plot_noncommutative_boundary_ultimate(
+        nc_result,
+        save_path='noncommutative_boundary.png'
+    )
+    plt.show()
+    
+    # ============================================================
+    # 実験結果サマリー（更新版）
+    # ============================================================
+
     print("\n" + "="*60)
     print("実験結果サマリー")
     print("="*60)
@@ -1002,6 +1413,7 @@ def run_holographic_experiment_ultimate():
             json.dump(Ξ_serializable, f, indent=2)
 
         print("  保存: Xi_boundary_ultimate.json")
+
 
     return {
         'params': params_opt,
