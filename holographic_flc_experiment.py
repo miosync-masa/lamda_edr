@@ -478,20 +478,25 @@ def diagnose_noncommutative_boundary_ultimate(
     
     # 1. Λ場の計算（既存）
     Lambda_field = np.array([
-        compute_Lambda_ultimate(params, beta) for beta in beta_fine
+        compute_Lambda_field_ultimate(params, beta) for beta in beta_fine
     ])
+
+    # 2. 境界Σの抽出（追加！）
+    Sigma = extract_critical_boundary_ultimate(params, beta_fine)
+    
+    if len(Sigma) == 0:
+        print("警告: 境界Σが検出されませんでした")
+        return {}
     
     # 2. Ξパケットの計算（既存）
-    Xi_packet = compute_boundary_info_packet_ultimate(
-        params, beta_fine, Lambda_field, verbose=False
-    )
+     Xi_packet = compute_boundary_info_packet_ultimate(params, Sigma)
     
     # 3. θ_effの計算（新規）
     theta_eff = compute_theta_eff(Xi_packet)
     
     # 4. 誤差場とマージンの計算
     Em_pred = np.array([
-        compute_Em_ultimate(params, beta, compute_Lambda_ultimate(params, beta))
+        compute_flc_point_ultimate(params, beta, beta_range_global)
         for beta in beta_fine
     ])
     
@@ -866,7 +871,7 @@ def solve_homotopy_ultimate_rho(flc_points: List[Tuple[float, float]],
 
     return params_phys, res
 
-    def sweep_rho_commutative_limit(
+def sweep_rho_commutative_limit(
         flc_points: List[Tuple[float, float]],
         rho_values: List[float] = None,
         physics_bounds: Dict = None,
