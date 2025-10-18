@@ -1,5 +1,6 @@
 """
 Holographic FLC Experiment
+AdS/CFT対応版
 """
 
 import numpy as np
