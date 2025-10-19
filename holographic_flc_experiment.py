@@ -443,94 +443,167 @@ def compute_noncommutative_signature(
     return result
 
 
-def diagnose_noncommutative_boundary_ultimate(
+
+def diagnose_noncommutative_boundary_local(
     params: Dict,
     flc_points: List[Tuple[float, float]],
     beta_fine: np.ndarray = None,
+    local_width: float = 0.05,  # Σ近傍の幅
+    n_local: int = 20,          # 近傍サンプル数
     verbose: bool = True,
 ) -> Dict:
     """
-    非可換境界の完全診断（究極版）
+    非可換境界の完全診断（Σ近傍評価版）
     
-    CSP制約下で検出されたΛ=1境界上に、
-    非可換幾何（AdS/CFT対応のCFT側）が
-    実現されているかを診断する。
+    BoundaryΣが1点でも、その近傍で局所的にサンプリングして
+    非可換性を評価する。
     
     Args:
         params: 最適化されたパラメータ辞書
         flc_points: FLCデータ点
         beta_fine: 診断用の細かいβ配列（Noneなら自動生成）
+        local_width: Σ近傍の幅（±local_width）
+        n_local: 近傍サンプル数
         verbose: 結果表示のON/OFF
         
     Returns:
         result: {
             'beta': β配列,
+            'beta_Sigma': 境界Σ,
+            'beta_local': 近傍サンプル点,
             'theta_eff': 非可換パラメータ,
             'Xi_packet': 境界情報パケット,
             'nc_signature': 非可換シグネチャ,
             'Lambda': Λ場,
-            'error_field': 誤差場,
-            'margin_field': マージン場,
+            ...
         }
     """
     if beta_fine is None:
         beta_fine = np.linspace(-0.5, 1.0, 200)
-        
-    beta_range_global = np.linspace(-0.5, 1.0, 50) 
     
-    # 1. Λ場の計算（既存）
+    beta_range_global = np.linspace(-0.5, 1.0, 50)
+    
+    # 1. Λ場の計算
     Lambda_field = np.array([
-        compute_Lambda_field_ultimate(params, beta) for beta in beta_fine
+        compute_Lambda_field_ultimate(params, beta, beta_range_global)
+        for beta in beta_fine
     ])
 
-    # 2. 境界Σの抽出（追加！）
+    # 2. 境界Σの抽出
     Sigma = extract_critical_boundary_ultimate(params, beta_fine)
     
     if len(Sigma) == 0:
         print("警告: 境界Σが検出されませんでした")
         return {}
     
-    # 2. Ξパケットの計算（既存）
-    Xi_packet = compute_boundary_info_packet_ultimate(params, Sigma)
+    if verbose:
+        print(f"\n境界Σ検出: {len(Sigma)}点")
+        for i, beta_c in enumerate(Sigma):
+            print(f"  Σ[{i}]: β = {beta_c:.4f}")
     
-    # 3. θ_effの計算（新規）
+    # ★3. Σ近傍での局所サンプリング
+    beta_local_all = []
+    
+    for beta_c in Sigma:
+        # 各Σ点の周りで±local_widthの範囲をサンプリング
+        beta_local = np.linspace(
+            beta_c - local_width, 
+            beta_c + local_width, 
+            n_local
+        )
+        beta_local_all.extend(beta_local)
+    
+    beta_local_all = np.array(sorted(set(beta_local_all)))  # 重複削除
+    
+    if verbose:
+        print(f"\n近傍サンプリング:")
+        print(f"  幅: ±{local_width}")
+        print(f"  Σ点あたり: {n_local}点")
+        print(f"  総サンプル数: {len(beta_local_all)}点")
+    
+    # 4. 近傍でのΞパケット計算
+    Xi_packet = compute_boundary_info_packet_ultimate(params, beta_local_all)
+    
+    # 5. θ_effの計算
     theta_eff = compute_theta_eff(Xi_packet)
     
-    # 4. 誤差場とマージンの計算
-    Em_pred = np.array([
+    # 6. 近傍での誤差場とマージンの計算
+    beta_obs = np.array([b for b, _ in flc_points])
+    Em_obs = np.array([e for _, e in flc_points])
+    
+    # 近傍での予測値
+    Em_pred_local = np.array([
+        compute_flc_point_ultimate(params, beta, beta_range_global)
+        for beta in beta_local_all
+    ])
+    
+    # 近傍での実測値（補間）
+    Em_obs_local = np.interp(beta_local_all, beta_obs, Em_obs)
+    
+    # 近傍でのΛ値
+    Lambda_local = np.array([
+        compute_Lambda_field_ultimate(params, beta, beta_range_global)
+        for beta in beta_local_all
+    ])
+    
+    # 近傍での誤差場とマージン
+    error_field_local = Em_pred_local - Em_obs_local
+    margin_field_local = np.abs(1.0 - Lambda_local)
+    
+    # 7. 非可換性の検出（近傍で評価）
+    if len(beta_local_all) >= 2:
+        nc_signature = compute_noncommutative_signature(
+            beta_local_all, theta_eff, error_field_local, margin_field_local
+        )
+    else:
+        nc_signature = {
+            'Delta_NC': 0.0, 
+            'contributions': np.array([]), 
+            'mean_abs': 0.0, 
+            'std': 0.0, 
+            'max_abs': 0.0
+        }
+    
+    # 8. 全β空間の情報も保持（可視化用）
+    Em_pred_all = np.array([
         compute_flc_point_ultimate(params, beta, beta_range_global)
         for beta in beta_fine
     ])
+    Em_interp_all = np.interp(beta_fine, beta_obs, Em_obs)
+    error_field_all = Em_pred_all - Em_interp_all
+    margin_field_all = np.abs(1.0 - Lambda_field)
     
-    # FLC実測値の補間
-    beta_obs = np.array([b for b, _ in flc_points])
-    Em_obs = np.array([e for _, e in flc_points])
-    Em_interp = np.interp(beta_fine, beta_obs, Em_obs)
-    
-    error_field = Em_pred - Em_interp
-    margin_field = np.abs(1.0 - Lambda_field)
-    
-    # 5. 非可換性の検出（新規）
-    nc_signature = compute_noncommutative_signature(
-        beta_fine, theta_eff, error_field, margin_field
-    )
-    
-    # 6. 結果の整理
+    # 9. 結果の整理
     result = {
-        'beta': beta_fine,
-        'theta_eff': theta_eff,
-        'Xi_packet': Xi_packet,
-        'nc_signature': nc_signature,
-        'Lambda': Lambda_field,
-        'error_field': error_field,
-        'margin_field': margin_field,
+        'beta': beta_fine,              # 全β範囲
+        'beta_Sigma': Sigma,            # 境界Σ
+        'beta_local': beta_local_all,   # 近傍サンプル点
+        'theta_eff': theta_eff,         # 近傍でのθ_eff
+        'Xi_packet': Xi_packet,         # 近傍でのΞパケット
+        'nc_signature': nc_signature,   # 非可換シグネチャ
+        'Lambda': Lambda_field,         # 全β範囲
+        'Lambda_local': Lambda_local,   # 近傍でのΛ
+        'error_field': error_field_all, # 全β範囲
+        'error_field_local': error_field_local,  # 近傍
+        'margin_field': margin_field_all,        # 全β範囲
+        'margin_field_local': margin_field_local,  # 近傍
     }
     
-    # 7. 結果表示
+    # 10. 結果表示
     if verbose:
         print("\n" + "="*60)
-        print("非可換境界診断（究極版）")
+        print("非可換境界診断（Σ近傍評価版）")
         print("="*60)
+        
+        print(f"\n【境界Σ情報】")
+        print(f"  検出点数: {len(Sigma)}点")
+        if len(Sigma) > 0:
+            print(f"  β範囲: [{np.min(Sigma):.3f}, {np.max(Sigma):.3f}]")
+        
+        print(f"\n【近傍評価領域】")
+        print(f"  β範囲: [{np.min(beta_local_all):.3f}, {np.max(beta_local_all):.3f}]")
+        print(f"  Λ範囲: [{np.min(Lambda_local):.3f}, {np.max(Lambda_local):.3f}]")
+        
         print(f"\n【非可換パラメータ θ_eff】")
         print(f"  平均: {np.mean(np.abs(theta_eff)):.6e}")
         print(f"  最大: {np.max(np.abs(theta_eff)):.6e}")
@@ -548,7 +621,7 @@ def diagnose_noncommutative_boundary_ultimate(
         else:
             print(f"  - 可換極限近傍（Δ_NC ≈ 0）")
         
-        print(f"\n【Ξパケット統計】")
+        print(f"\n【Ξパケット統計（近傍平均）】")
         print(f"  ω_Λ平均: {np.mean(np.abs(Xi_packet['omega_Lambda'])):.6e}")
         print(f"  |∂_nΛ|平均: {np.mean(np.abs(Xi_packet['grad_n_Lambda'])):.6e}")
         print(f"  j_n平均: {np.mean(np.abs(Xi_packet['j_n'])):.6e}")
@@ -939,7 +1012,7 @@ def sweep_rho_commutative_limit(
         )
         
         # 非可換診断
-        nc_result = diagnose_noncommutative_boundary_ultimate(
+        nc_result = diagnose_noncommutative_boundary_local(
             params, flc_points, verbose=False
         )
         
@@ -959,7 +1032,7 @@ def sweep_rho_commutative_limit(
     # (A) θ_eff vs ρ
     ax = axes[0]
     ax.plot(rho_values, theta_eff_means, 'o-', linewidth=2, markersize=8)
-    ax.set_xlabel('ρ (boundary control)', fontsize=12)
+    ax.set_xlabel('ρ_boundary control', fontsize=12)
     ax.set_ylabel('<|θ_eff|>', fontsize=12)
     ax.set_title('Commutative Limit:\nθ_eff → 0 as ρ → 0', 
                  fontsize=12, fontweight='bold')
@@ -994,83 +1067,114 @@ def sweep_rho_commutative_limit(
 # Section 5.6: 非可換境界の可視化関数
 # =============================================================================
 
-def plot_noncommutative_boundary_ultimate(result: Dict, save_path: str = None):
+def plot_noncommutative_boundary_local(result: Dict, save_path: str = None):
     """
-    非可換境界の可視化（究極版）
+    非可換境界の可視化（Σ近傍評価版）
     
     4つのサブプロット:
-      (A) θ_eff分布
-      (B) Ξパケット3成分
+      (A) θ_eff分布（近傍のみ）
+      (B) Ξパケット3成分（近傍のみ）
       (C) 非可換寄与Δ_NC
-      (D) θ_eff vs ω_Λ 相関
-    
-    Args:
-        result: diagnose_noncommutative_boundary_ultimate の出力
-        save_path: 保存先パス（Noneなら保存しない）
+      (D) Λ場全体 + 近傍領域表示
     """
+    import matplotlib.pyplot as plt
+    
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     
-    beta = result['beta']
+    beta_local = result['beta_local']
     theta_eff = result['theta_eff']
     Xi = result['Xi_packet']
     nc_sig = result['nc_signature']
+    beta_Sigma = result['beta_Sigma']
     
-    # (A) θ_effの分布
+    # (A) θ_effの分布（近傍のみ）
     ax = axes[0, 0]
-    ax.plot(beta, theta_eff, 'b-', linewidth=2, label='θ_eff')
+    ax.plot(beta_local, theta_eff, 'b-', linewidth=2, label='θ_eff')
     ax.axhline(0, color='k', linestyle='--', alpha=0.3)
-    ax.fill_between(beta, 0, theta_eff, alpha=0.2)
+    ax.fill_between(beta_local, 0, theta_eff, alpha=0.2)
+    
+    # Σ点をマーク
+    for beta_c in beta_Sigma:
+        ax.axvline(beta_c, color='r', linestyle='--', alpha=0.5, linewidth=1.5)
+    
     ax.set_xlabel('β (strain ratio)', fontsize=12)
     ax.set_ylabel('θ_eff (noncommutativity)', fontsize=12)
-    ax.set_title(f'(A) Noncommutative Parameter\n<|θ_eff|> = {np.mean(np.abs(theta_eff)):.3e}', 
+    ax.set_title(f'(A) Noncommutative Parameter (Local)\n<|θ_eff|> = {np.mean(np.abs(theta_eff)):.3e}', 
                  fontsize=12, fontweight='bold')
     ax.legend(fontsize=10)
     ax.grid(alpha=0.3)
     
-    # (B) Ξの3成分
+    # (B) Ξの3成分（近傍のみ）
     ax = axes[0, 1]
-    ax.plot(beta, Xi['omega_Lambda'], 'r-', linewidth=2, label='ω_Λ (vorticity/B-field)')
-    ax.plot(beta, Xi['grad_n_Lambda'], 'g-', linewidth=2, label='|∂_nΛ| (hardness)')
-    ax.plot(beta, Xi['j_n'], 'b-', linewidth=2, label='j_n (flux)')
+    ax.plot(beta_local, Xi['omega_Lambda'], 'r-', linewidth=2, label='ω_Λ (vorticity/B-field)')
+    ax.plot(beta_local, Xi['grad_n_Lambda'], 'g-', linewidth=2, label='|∂_nΛ| (hardness)')
+    ax.plot(beta_local, Xi['j_n'], 'b-', linewidth=2, label='j_n (flux)')
+    
+    # Σ点をマーク
+    for beta_c in beta_Sigma:
+        ax.axvline(beta_c, color='r', linestyle='--', alpha=0.5, linewidth=1.5)
+    
     ax.set_xlabel('β', fontsize=12)
     ax.set_ylabel('Ξ components', fontsize=12)
-    ax.set_title('(B) Boundary Information Packet (Ξ)', fontsize=12, fontweight='bold')
+    ax.set_title('(B) Boundary Information Packet (Local)', fontsize=12, fontweight='bold')
     ax.legend(fontsize=9)
     ax.grid(alpha=0.3)
     
     # (C) 順序依存性の寄与
     ax = axes[1, 0]
     contributions = nc_sig['contributions']
-    colors = ['red' if c > 0 else 'blue' for c in contributions]
-    ax.bar(range(len(contributions)), contributions, color=colors, alpha=0.7)
-    ax.axhline(0, color='k', linestyle='-', linewidth=1)
+    if len(contributions) > 0:
+        colors = ['red' if c > 0 else 'blue' for c in contributions]
+        ax.bar(range(len(contributions)), contributions, color=colors, alpha=0.7)
+        ax.axhline(0, color='k', linestyle='-', linewidth=1)
     ax.set_xlabel('segment index', fontsize=12)
     ax.set_ylabel('NC contribution [f,g]_θ', fontsize=12)
     ax.set_title(f"(C) Order Dependence\nΔ_NC = {nc_sig['Delta_NC']:.6e}", 
                  fontsize=12, fontweight='bold')
     ax.grid(alpha=0.3, axis='y')
     
-    # (D) θ_eff vs ω_Λ の相関
+    # (D) Λ場全体 + 近傍領域表示
     ax = axes[1, 1]
-    scatter = ax.scatter(Xi['omega_Lambda'], theta_eff, 
-                        c=np.abs(result['Lambda'] - 1.0), 
-                        cmap='viridis', alpha=0.6, s=30)
-    ax.set_xlabel('ω_Λ (omega_Lambda)', fontsize=12)
-    ax.set_ylabel('θ_eff', fontsize=12)
-    ax.set_title('(D) θ_eff vs B-field (ω_Λ)\ncolor = |Λ-1|', 
-                 fontsize=12, fontweight='bold')
+    beta_all = result['beta']
+    Lambda_all = result['Lambda']
+    Lambda_local = result['Lambda_local']
+    
+    # 全体のΛ場（薄く）
+    ax.plot(beta_all, Lambda_all, 'b-', linewidth=1.5, alpha=0.3, label='Λ field (全体)')
+    
+    # 近傍のΛ場（濃く）
+    ax.plot(beta_local, Lambda_local, 'b-', linewidth=2.5, label='Λ field (近傍)')
+    
+    # Λ=1
+    ax.axhline(1.0, color='r', linestyle='--', linewidth=2, label='Λ=1')
+    
+    # Σ点をマーク
+    Lambda_at_Sigma = result['Lambda_local'][[
+        np.argmin(np.abs(beta_local - bc)) for bc in beta_Sigma
+    ]]
+    ax.scatter(beta_Sigma, Lambda_at_Sigma, c='red', s=150, zorder=5,
+              edgecolors='darkred', linewidth=2, label='BoundaryΣ')
+    
+    # 近傍領域を網掛け
+    beta_min_local = np.min(beta_local)
+    beta_max_local = np.max(beta_local)
+    ax.axvspan(beta_min_local, beta_max_local, alpha=0.1, color='cyan', 
+              label='評価領域')
+    
+    ax.set_xlabel('β', fontsize=12)
+    ax.set_ylabel('Λ', fontsize=12)
+    ax.set_title('(D) Λ Field + Local Region', fontsize=12, fontweight='bold')
+    ax.legend(fontsize=9)
     ax.grid(alpha=0.3)
-    cbar = plt.colorbar(scatter, ax=ax)
-    cbar.set_label('|Λ-1|', fontsize=10)
     
     plt.tight_layout()
     
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"\n非可換境界図を保存: {save_path}")
+        print(f"\n非可換境界図（近傍版）を保存: {save_path}")
     
-    return fig   
-
+    return fig
+    
 # =============================================================================
 # Section 6: クイック診断
 # =============================================================================
@@ -1167,7 +1271,7 @@ def visualize_ultimate_result(params_dict, flc_points, beta_range):
                     where=np.array(Lambda_field)<1.0, alpha=0.3, color='blue')
     ax.set_xlabel('β', fontsize=12)
     ax.set_ylabel('Λ', fontsize=12)
-    ax.set_title('(a)Λfield（99%）', fontsize=13, fontweight='bold')
+    ax.set_title('a_Λfield', fontsize=13, fontweight='bold')
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
 
@@ -1184,7 +1288,7 @@ def visualize_ultimate_result(params_dict, flc_points, beta_range):
 
     ax.set_xlabel('β', fontsize=12)
     ax.set_ylabel('Λ', fontsize=12)
-    ax.set_title(f'(b)BoundaryΣ（{len(Sigma)}point）', fontsize=13, fontweight='bold')
+    ax.set_title(f'b_BoundaryΣ（{len(Sigma)}point）', fontsize=13, fontweight='bold')
     ax.legend(fontsize=11)
     ax.grid(True, alpha=0.3)
 
@@ -1195,7 +1299,7 @@ def visualize_ultimate_result(params_dict, flc_points, beta_range):
     ax.plot(beta_fine, V_viscosity, 'purple', linewidth=2.5, label=f'V_eff^{alpha:.2f}')
     ax.set_xlabel('β', fontsize=12)
     ax.set_ylabel('V_eff^α', fontsize=12)
-    ax.set_title(f'(c)viscosityTerm（α={alpha:.3f}）', fontsize=13, fontweight='bold')
+    ax.set_title(f'c_viscosityTerm α={alpha:.3f}', fontsize=13, fontweight='bold')
     ax.fill_between(beta_fine, 1.0, V_viscosity, alpha=0.2, color='purple')
     ax.axhline(y=1.0, color='gray', linestyle='--', alpha=0.5)
     ax.legend(fontsize=11)
@@ -1218,7 +1322,7 @@ def visualize_ultimate_result(params_dict, flc_points, beta_range):
 
     ax.set_xlabel('β', fontsize=12)
     ax.set_ylabel('Em', fontsize=12)
-    ax.set_title('(d)FLC prediction', fontsize=13, fontweight='bold')
+    ax.set_title('d_FLC prediction', fontsize=13, fontweight='bold')
     ax.legend(fontsize=11)
     ax.grid(True, alpha=0.3)
 
@@ -1239,7 +1343,7 @@ def visualize_ultimate_result(params_dict, flc_points, beta_range):
     ax.axhline(y=0.1, color='green', linestyle='--', linewidth=1.5, label='0.1%', alpha=0.7)
     ax.axhline(y=1.0, color='lightgreen', linestyle='--', linewidth=1.5, label='1%', alpha=0.7)
     ax.set_ylabel('Error (%)', fontsize=12)
-    ax.set_title(f'(e)Prediction error（Average: {np.mean(errors):.3f}%）',
+    ax.set_title(f'e_Prediction error Average: {np.mean(errors):.3f}%',
                 fontsize=13, fontweight='bold')
     ax.set_xticks(range(len(errors)))
     ax.set_xticklabels([f'{b:.2f}' for b, _ in flc_points], fontsize=10)
@@ -1280,10 +1384,11 @@ parameters:
 def run_holographic_experiment_ultimate():
     """ホログラフィック実験（究極版ρ）"""
     print("="*60)
-    print("Λ–Holo双対性 実験 - Ultimate Edition (ρ)")
+    print("Λ–Holo双対性 SPCC実験 - Ultimate Edition (ρ)")
     print("オーバーシュート係数で横切り確定")
     print("="*60)
 
+    """SPCC
     flc_points = [
         (-0.5, 0.38),
         (-0.25, 0.32),
@@ -1291,6 +1396,16 @@ def run_holographic_experiment_ultimate():
         (0.25, 0.23),
         (0.5, 0.20),
         (1.0, 0.18),
+    ]
+    """
+    #アルミ
+    flc_points = [
+        (-0.5, 0.45),  # 延性高め
+        (-0.25, 0.38),
+        (0.0, 0.30),
+        (0.25, 0.28),
+        (0.5, 0.25),
+        (1.0, 0.22),
     ]
 
     physics_bounds = {
@@ -1304,7 +1419,7 @@ def run_holographic_experiment_ultimate():
         'E_gain': (0.01, 15.0),
         'gamma': (0.1, 3.0),
         'eta': (-3.0, 6.0),
-        'alpha': (0.0, 2.5),  # ★軽く絞る
+        'alpha': (0.0, 2.8),  # ★軽く絞る
         'rho': (0.005, 0.08),  # 🔥 追加！
     }
 
@@ -1356,18 +1471,21 @@ def run_holographic_experiment_ultimate():
     print("非可換境界診断（AdS/CFT対応）")
     print("="*60)
     
-    nc_result = diagnose_noncommutative_boundary_ultimate(
+    nc_result = diagnose_noncommutative_boundary_local(
         params_opt, 
         flc_points,
+        local_width=0.05,  # Σ±0.05の範囲
+        n_local=20,        # 20点サンプリング
         verbose=True
     )
     
-    # 可視化
-    fig_nc = plot_noncommutative_boundary_ultimate(
-        nc_result,
-        save_path='noncommutative_boundary.png'
-    )
-    plt.show()
+     # 可視化
+    if nc_result:  # 結果が空でない場合のみ
+        fig_nc = plot_noncommutative_boundary_local(
+            nc_result,
+            save_path='noncommutative_boundary_local.png'
+        )
+        plt.show()
     
     # ============================================================
     # 実験結果サマリー（更新版）
@@ -1433,8 +1551,11 @@ def run_holographic_experiment_ultimate():
         'Lambda_crosses': Lambda_crosses,
         'Sigma_detected': len(Sigma) > 0,
         'errors': errors,
-        'avg_error': np.mean(errors)
+        'avg_error': np.mean(errors),
+        'nc_result': nc_result  # 非可換診断結果も追加
     }
+
+    return results
 
 # 実行
 if __name__ == "__main__":
